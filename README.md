@@ -38,7 +38,7 @@ Supervised-классификация разрешена только когда
 ## Требования
 
 - Linux;
-- Python 3.11;
+- Python 3.11, 3.12 или 3.13;
 - Node.js 18+ и npm;
 - около 4 ГБ RAM для синтетики по умолчанию на 3 000 клиентов × 24 месяца.
 
@@ -63,10 +63,18 @@ make dev
 CASHGAP_API_PORT=8010 CASHGAP_UI_PORT=5174 make dev
 ```
 
-Если Python 3.11 доступен под другим именем:
+`make setup` автоматически выбирает существующий `.venv`, затем `python3.13`, `python3.12` или `python3.11`. Если совместимый Python доступен под другим именем:
 
 ```bash
 PYTHON_BIN=/usr/bin/python3.11 make setup
+```
+
+На корпоративной машине, где уже установлен только Python 3.13, достаточно:
+
+```bash
+git pull
+make setup
+make dev
 ```
 
 ## Демо целиком
