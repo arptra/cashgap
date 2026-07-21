@@ -1,0 +1,9 @@
+transaction_description,category,country,currency
+Monthly office rent,RENT,US,USD
+Office lease payment,RENT,US,USD
+Cloud hosting invoice,SOFTWARE,US,USD
+SaaS subscription,SOFTWARE,GB,GBP
+Employee payroll,SALARY,US,USD
+Monthly wages,SALARY,IN,INR
+Tax authority payment,TAX,US,USD
+Quarterly tax,TAX,GB,GBP

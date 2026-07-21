@@ -1,0 +1,4 @@
+step,type,amount,nameOrig,oldbalanceOrg,newbalanceOrig,nameDest,oldbalanceDest,newbalanceDest,isFraud,isFlaggedFraud
+0,PAYMENT,100,C001,1000,900,M001,0,0,0,0
+24,TRANSFER,250,C001,900,650,C002,100,350,1,0
+744,CASH_IN,80,C001,650,730,C003,500,420,0,0

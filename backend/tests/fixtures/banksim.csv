@@ -1,0 +1,4 @@
+step,customer,age,gender,zipcodeOri,merchant,zipMerchant,category,amount,fraud
+0,C001,3,M,28007,M001,28007,es_food,25.5,0
+31,C001,3,M,28007,M002,28007,es_transportation,40.0,1
+32,C002,4,F,28007,M001,28007,es_food,12.0,0

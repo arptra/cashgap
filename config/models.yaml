@@ -1,0 +1,176 @@
+models:
+  - id: shell_catboost_darts_3rd
+    name: Shell Cashflow — 3rd Place CatBoost + Darts
+    type: competition_recipe
+    provider: kaggle
+    kernel_ref: xdebron/3rd-solution-catboost-darts-72-days-horizon
+    task: cash_flow_forecasting
+    plugin: shell_catboost_darts
+    requires_training: true
+    cpu_supported: true
+    compatible_targets: [total_credit_sum, total_debit_sum, net_flow]
+    description: Рецепт решения 3-го места Shell Cashflow Datathon; credit и debit прогнозируются отдельно.
+    source_url: https://www.kaggle.com/code/xdebron/3rd-solution-catboost-darts-72-days-horizon
+    license: null
+    limitations: [notebook_is_attribution_only, source_must_be_connected, no_arbitrary_code_execution]
+
+  - id: shell_prophet_8th
+    name: Shell Cashflow — 8th Place Prophet
+    type: competition_recipe
+    provider: kaggle
+    kernel_ref: gamzeakkurt/cashflow-forecasting-using-prophet-8th-place
+    task: cash_flow_forecasting
+    plugin: shell_prophet
+    requires_training: true
+    cpu_supported: true
+    compatible_targets: [total_credit_sum, total_debit_sum, net_flow]
+    description: Понятный Prophet baseline по мотивам решения 8-го места Shell Cashflow Datathon.
+    source_url: https://www.kaggle.com/code/gamzeakkurt/cashflow-forecasting-using-prophet-8th-place
+    license: null
+    dependency: prophet
+    install_command: .venv/bin/pip install prophet
+    limitations: [notebook_is_attribution_only, source_must_be_connected, prophet_optional]
+
+  - id: chronos_bolt_tiny
+    name: Amazon Chronos-Bolt Tiny
+    type: pretrained_model
+    provider: huggingface
+    model_id: amazon/chronos-bolt-tiny
+    task: cash_flow_forecasting
+    plugin: chronos_bolt
+    requires_training: false
+    supports_zero_shot: true
+    cpu_supported: true
+    compatible_targets: [total_credit_sum, total_debit_sum, net_flow]
+    description: Компактная zero-shot foundation model для пакетного вероятностного прогноза.
+    source_url: https://huggingface.co/amazon/chronos-bolt-tiny
+    license: Apache-2.0
+    dependency: chronos
+    install_command: .venv/bin/pip install chronos-forecasting==2.3.1
+
+  - id: chronos_bolt_small
+    name: Amazon Chronos-Bolt Small
+    type: pretrained_model
+    provider: huggingface
+    model_id: amazon/chronos-bolt-small
+    task: cash_flow_forecasting
+    plugin: chronos_bolt
+    requires_training: false
+    supports_zero_shot: true
+    cpu_supported: true
+    compatible_targets: [total_credit_sum, total_debit_sum, net_flow]
+    description: Более тяжёлый zero-shot challenger для Chronos-Bolt Tiny.
+    source_url: https://huggingface.co/amazon/chronos-bolt-small
+    license: Apache-2.0
+    dependency: chronos
+    install_command: .venv/bin/pip install chronos-forecasting==2.3.1
+
+  - id: chronos_2
+    name: Amazon Chronos-2
+    type: pretrained_model
+    provider: huggingface
+    model_id: amazon/chronos-2
+    task: cash_flow_forecasting
+    plugin: chronos_2
+    requires_training: false
+    supports_zero_shot: true
+    supports_multivariate: true
+    supports_covariates: true
+    cpu_supported: true
+    compatible_targets: [total_credit_sum, total_debit_sum, net_flow]
+    description: Отдельный Chronos-2 adapter с DataFrame API и поддержкой covariates.
+    source_url: https://huggingface.co/amazon/chronos-2
+    license: Apache-2.0
+    dependency: chronos
+    install_command: .venv/bin/pip install chronos-forecasting==2.3.1
+
+  - id: timesfm_2_5
+    name: Google TimesFM 2.5
+    type: pretrained_model
+    provider: huggingface
+    model_id: google/timesfm-2.5-200m-pytorch
+    task: cash_flow_forecasting
+    plugin: timesfm
+    requires_training: false
+    supports_zero_shot: true
+    cpu_supported: true
+    compatible_targets: [total_credit_sum, total_debit_sum, net_flow]
+    description: TimesFM 2.5 point и quantile forecast через официальный PyTorch package.
+    source_url: https://huggingface.co/google/timesfm-2.5-200m-pytorch
+    license: Apache-2.0
+    dependency: timesfm
+    install_command: ".venv/bin/pip install 'timesfm[torch]'"
+    limitations: [package_version_must_support_TimesFM_2p5_200M_torch]
+
+  - id: seasonal_naive_local
+    name: Seasonal Naive Baseline
+    type: local_trainable_model
+    provider: local
+    task: cash_flow_forecasting
+    plugin: seasonal_naive
+    requires_training: false
+    cpu_supported: true
+    compatible_targets: [total_credit_sum, total_debit_sum, net_flow]
+    description: Детерминированный локальный baseline без внешних весов.
+    license: internal
+
+  - id: shell_style_catboost_lag
+    name: Shell-style CatBoost Lag Recipe
+    type: local_trainable_model
+    provider: local
+    task: cash_flow_forecasting
+    plugin: shell_catboost_darts
+    requires_training: true
+    cpu_supported: true
+    compatible_targets: [total_credit_sum, total_debit_sum, net_flow]
+    description: Безопасная локальная реализация lag/rolling-рецепта; не выдаётся за скачанный notebook.
+    license: internal
+    limitations: [normalized_internal_recipe, not_the_original_notebook]
+
+  - id: logistic_cashgap
+    name: LogisticRegression Cash-Gap
+    type: local_trainable_model
+    provider: local
+    task: cash_gap_classification
+    plugin: logistic_cashgap
+    requires_training: true
+    cpu_supported: true
+    compatible_targets: [cash_gap_next_month]
+    description: Интерпретируемый линейный classifier с point-in-time признаками.
+    license: internal
+
+  - id: catboost_cashgap
+    name: CatBoost Cash-Gap
+    type: local_trainable_model
+    provider: local
+    task: cash_gap_classification
+    plugin: catboost_cashgap
+    requires_training: true
+    cpu_supported: true
+    compatible_targets: [cash_gap_next_month]
+    description: CPU CatBoost classifier для нелинейных cash-gap зависимостей.
+    license: internal
+
+  - id: lightgbm_cashgap
+    name: LightGBM Cash-Gap
+    type: local_trainable_model
+    provider: local
+    task: cash_gap_classification
+    plugin: lightgbm_cashgap
+    requires_training: true
+    cpu_supported: true
+    compatible_targets: [cash_gap_next_month]
+    description: Быстрый CPU gradient boosting classifier.
+    license: internal
+
+  - id: random_forest_cashgap
+    name: RandomForest Cash-Gap
+    type: local_trainable_model
+    provider: local
+    task: cash_gap_classification
+    plugin: random_forest_cashgap
+    requires_training: true
+    cpu_supported: true
+    compatible_targets: [cash_gap_next_month]
+    description: Устойчивый нелинейный локальный baseline.
+    license: internal

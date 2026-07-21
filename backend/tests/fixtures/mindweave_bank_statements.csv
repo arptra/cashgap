@@ -1,0 +1,4 @@
+statement_date,bank_account_id,closing_balance
+2023-01-01,BA1,1000
+2023-01-31,BA1,1800
+2023-02-28,BA1,1550

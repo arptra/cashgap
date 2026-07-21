@@ -1,0 +1,102 @@
+datasets:
+  - id: kaggle_paysim
+    title: Kaggle PaySim
+    provider: kaggle_dataset
+    remote_id: ealaxi/paysim1
+    adapter: paysim
+    supported_tasks: [data_ingestion_demo, monthly_aggregation, balance_breach_proxy, proxy_risk]
+    cash_gap_target: false
+    requires_auth: true
+
+  - id: kaggle_banksim
+    title: Kaggle BankSim
+    provider: kaggle_dataset
+    remote_id: ealaxi/banksim1
+    adapter: banksim
+    supported_tasks: [data_ingestion_demo, debit_flow_forecasting, transaction_category_analysis]
+    cash_gap_target: false
+    requires_auth: true
+    limitations: [debit_only, no_balance, no_credit_flow]
+
+  - id: kaggle_ibm_aml
+    title: Kaggle IBM AML
+    provider: kaggle_dataset
+    remote_id: ealtman2019/ibm-transactions-for-anti-money-laundering-aml
+    adapter: ibm_aml
+    supported_tasks: [data_ingestion_demo, monthly_aggregation, flow_forecasting, proxy_risk]
+    cash_gap_target: false
+    requires_auth: true
+    license_note: CDLA-Sharing-1.0 for data
+
+  - id: kaggle_shell_cashflow
+    title: Kaggle Shell Cashflow Datathon 2023
+    provider: kaggle_competition
+    remote_id: new-shell-cashflow-datathon-2023
+    adapter: shell_cashflow
+    supported_tasks: [flow_forecasting]
+    cash_gap_target: false
+    requires_auth: true
+    limitations: [aggregate_series, not_client_level]
+
+  - id: hf_paysim_banks
+    title: Hugging Face PaySim Banks
+    provider: huggingface
+    remote_id: flwrlabs/fed-fraud-paysim-banks
+    adapter: paysim
+    supported_tasks: [data_ingestion_demo, monthly_aggregation, balance_breach_proxy, proxy_risk]
+    cash_gap_target: false
+    requires_auth: false
+    license_note: CC-BY-4.0
+
+  - id: hf_indian_bank_statements
+    title: Hugging Face Indian Bank Statements
+    provider: huggingface
+    remote_id: AgamiAI/Indian-Bank-Statements
+    adapter: agami_indian_statements
+    supported_tasks: [data_ingestion_demo, monthly_aggregation, flow_forecasting, balance_breach_proxy, proxy_risk]
+    cash_gap_target: false
+    requires_auth: false
+    license_note: Apache-2.0
+    download_patterns: ['*.json', '*.jsonl']
+    usage_note: JSON only; PDF and OCR are intentionally excluded
+
+  - id: hf_us_bank_transactions
+    title: Hugging Face US Bank Transactions
+    provider: huggingface
+    remote_id: mindweave/bank-transactions-us
+    adapter: mindweave_us
+    supported_tasks: [data_ingestion_demo, flow_forecasting]
+    cash_gap_target: false
+    requires_auth: false
+    license_note: CC-BY-NC-4.0
+    usage_note: demo_only_until_legal_review
+    limitations: [one_company, free_sample]
+
+  - id: hf_transaction_categorization
+    title: Hugging Face Transaction Categorization
+    provider: huggingface
+    remote_id: mitulshah/transaction-categorization
+    adapter: transaction_categorization
+    supported_tasks: [transaction_categorization]
+    cash_gap_target: false
+    requires_auth: false
+    limitations: [no_client_id, no_date, no_amount, cannot_build_monthly_cashflow]
+
+  - id: http_direct
+    title: Direct HTTP / GitHub file
+    provider: http
+    adapter: auto
+    supported_tasks: [data_ingestion_demo, monthly_aggregation, flow_forecasting]
+    cash_gap_target: false
+    requires_auth: false
+    usage_note: URL and adapter are provided before download
+
+  - id: local_file
+    title: Local file
+    provider: local
+    adapter: auto
+    supported_tasks: [data_ingestion_demo, monthly_aggregation, flow_forecasting, transaction_categorization]
+    cash_gap_target: false
+    requires_auth: false
+    usage_note: Path must be readable by the local backend
+
