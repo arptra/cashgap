@@ -23,5 +23,12 @@ if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
   exit 1
 fi
 
+# Corporate proxies often allow huggingface.co but block the separate Xet/CAS
+# transfer path used for large model weights. Prefer regular HTTPS downloads
+# and allow enough time for files approaching 1 GB.
+export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
+export HF_HUB_DOWNLOAD_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT:-600}"
+export HF_HUB_ETAG_TIMEOUT="${HF_HUB_ETAG_TIMEOUT:-60}"
+
 cd "$PROJECT_DIR"
 exec "$PYTHON_BIN" "$PROJECT_DIR/start.py"

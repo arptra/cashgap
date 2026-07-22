@@ -4,7 +4,7 @@ import { useNavigate } from 'react-router-dom'
 import { datasetApi, errorMessage, modelApi } from '../api'
 import PageHeader from '../components/PageHeader'
 import StatusBadge from '../components/StatusBadge'
-import type { ModelDefinition } from '../types'
+import type { Job, ModelDefinition } from '../types'
 
 const typeNames = {
   competition_recipe: 'Решение соревнования',
@@ -18,7 +18,11 @@ function bytes(value: number) {
   return `${(value / 1024 ** 2).toFixed(1)} MB`
 }
 
-function ModelCard({ model, datasetId, compared, toggle }: { model: ModelDefinition; datasetId: string; compared: boolean; toggle: () => void }) {
+function latestError(error?: string) {
+  return error?.trim().split('\n').filter(Boolean).slice(-1)[0]
+}
+
+function ModelCard({ model, datasetId, compared, toggle, installJob }: { model: ModelDefinition; datasetId: string; compared: boolean; toggle: () => void; installJob?: Job }) {
   const navigate = useNavigate()
   const client = useQueryClient()
   const target = model.task === 'cash_gap_classification' ? 'cash_gap_next_month' : 'net_flow'
@@ -35,6 +39,7 @@ function ModelCard({ model, datasetId, compared, toggle }: { model: ModelDefinit
     <div className="tag-row"><span>{model.provider}</span><span>{model.task}</span><span>{model.requires_training ? 'нужно обучение' : 'zero-shot'}</span><span>{model.cpu_supported ? 'CPU' : 'GPU'}</span></div>
     <dl className="source-meta"><div><dt>Совместимость</dt><dd>{!datasetId ? 'выберите dataset' : compatibility.isLoading ? 'проверяется' : compatibility.data?.compatible ? 'совместима' : 'нет'}</dd></div><div><dt>Размер</dt><dd>{bytes(model.environment.size_bytes)}</dd></div><div><dt>Лицензия</dt><dd>{model.license ?? 'не определена'}</dd></div></dl>
     <p className="hint">{model.environment.message}</p>
+    {installJob && <div className="model-install-job"><StatusBadge status={installJob.status} /><span>{installJob.message}</span>{installJob.error && <p className="error-message">{latestError(installJob.error)}</p>}</div>}
     {model.environment.revision && <p className="revision">Revision: <code>{model.environment.revision}</code></p>}
     {compatibility.data && !compatibility.data.compatible && <p className="warning">{compatibility.data.reasons.join('; ')}</p>}
     {model.limitations.length > 0 && <details><summary>Ограничения</summary><p className="hint">{model.limitations.join(', ')}</p></details>}
@@ -57,6 +62,7 @@ function ModelCard({ model, datasetId, compared, toggle }: { model: ModelDefinit
 export default function ModelsPage() {
   const navigate = useNavigate()
   const models = useQuery({ queryKey: ['models'], queryFn: modelApi.list, refetchInterval: 5000 })
+  const jobs = useQuery({ queryKey: ['model-jobs'], queryFn: modelApi.jobs, refetchInterval: 2000 })
   const datasets = useQuery({ queryKey: ['datasets'], queryFn: datasetApi.list })
   const availableDatasets = datasets.data?.filter((dataset) => dataset.status === 'completed' && dataset.summary?.stage === 'normalized') ?? []
   const [datasetId, setDatasetId] = useState('')
@@ -68,6 +74,6 @@ export default function ModelsPage() {
     <PageHeader eyebrow="Model-first workspace" title="Модели и решения" text="Готовые модели, решения соревнований и локальные алгоритмы для прогнозирования денежных потоков и риска кассового разрыва." />
     <section className="panel model-toolbar"><label>Текущий dataset<select value={datasetId} onChange={(event) => setDatasetId(event.target.value)}><option value="">Выберите для проверки совместимости</option>{availableDatasets.map((dataset) => <option key={dataset.id} value={dataset.id}>{dataset.id} · {dataset.summary?.source_id}</option>)}</select></label><div className="task-tabs"><button className={filter === 'all' ? 'active' : ''} onClick={() => setFilter('all')}>Все</button><button className={filter === 'competition_recipe' ? 'active' : ''} onClick={() => setFilter('competition_recipe')}>Соревнования</button><button className={filter === 'pretrained_model' ? 'active' : ''} onClick={() => setFilter('pretrained_model')}>Pretrained</button><button className={filter === 'local_trainable_model' ? 'active' : ''} onClick={() => setFilter('local_trainable_model')}>Локальные</button></div><span className="selection-counter">В сравнении: {compared.length}</span><button className="button" disabled={!compared.length} onClick={() => navigate(`/run?models=${encodeURIComponent(compared.join(','))}`)}>Настроить выбранные</button></section>
     {models.error && <p className="error-message">{errorMessage(models.error)}</p>}
-    <div className="model-catalog">{visible.map((model) => <ModelCard key={model.id} model={model} datasetId={datasetId} compared={compared.includes(model.id)} toggle={() => toggle(model.id)} />)}</div>
+    <div className="model-catalog">{visible.map((model) => <ModelCard key={model.id} model={model} datasetId={datasetId} compared={compared.includes(model.id)} toggle={() => toggle(model.id)} installJob={jobs.data?.find((job) => job.job_type === 'model_install' && job.options?.model_id === model.id)} />)}</div>
   </>
 }
