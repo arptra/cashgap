@@ -1,0 +1,7 @@
+{
+  "model_id": "amazon/chronos-bolt-tiny",
+  "revision": "a0e552de83495b5c28c14c71c374f3e33280b340",
+  "source_url": "https://huggingface.co/amazon/chronos-bolt-tiny",
+  "license": "Apache-2.0",
+  "safe_formats_only": true
+}

@@ -24,6 +24,10 @@ data/normalized/*
 !data/normalized/.gitkeep
 cache/*
 !cache/.gitkeep
+!cache/models/
+cache/models/*
+!cache/models/chronos_bolt_tiny/
+!cache/models/chronos_bolt_tiny/**
 logs/*
 !logs/.gitkeep
 artifacts/models/*
