@@ -41,6 +41,7 @@ models:
     requires_training: false
     supports_zero_shot: true
     cpu_supported: true
+    bundled: true
     compatible_targets: [total_credit_sum, total_debit_sum, net_flow]
     description: Компактная zero-shot foundation model для пакетного вероятностного прогноза.
     source_url: https://huggingface.co/amazon/chronos-bolt-tiny

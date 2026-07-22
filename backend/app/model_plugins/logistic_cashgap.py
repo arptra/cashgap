@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import time
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,23 @@ class LocalCashGapPlugin(BaseModelPlugin):
     legacy_model_name = "logistic_regression"
 
     def check_environment(self) -> EnvironmentReport:
+        module = {
+            "catboost": "catboost",
+            "lightgbm": "lightgbm",
+        }.get(self.legacy_model_name, "sklearn")
+        if importlib.util.find_spec(module) is None:
+            install_command = (
+                ".venv/bin/pip install -r backend/requirements-lightgbm.txt"
+                if module == "lightgbm"
+                else f".venv/bin/pip install {module}"
+            )
+            return EnvironmentReport(
+                status=ModelStatus.NOT_INSTALLED,
+                message=f"Не установлена библиотека {module}",
+                installed=False,
+                dependency_installed=False,
+                install_command=install_command,
+            )
         return EnvironmentReport(status=ModelStatus.INSTALLED, message="Локальный CPU classifier готов", installed=True)
 
     def run(self, dataset: dict[str, Any], options: dict[str, Any]) -> PluginRunResult:

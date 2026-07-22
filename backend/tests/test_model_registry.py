@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 from pathlib import Path
 
 import huggingface_hub
 
+from app.api import models as models_api
 from app.model_plugins import create_model_plugin
+from app.models_registry import installer as model_installer
 from app.models_registry.installer import cache_metadata, install_pretrained, uninstall_model
 from app.models_registry.registry import get_model_spec, load_model_specs
 from app.models_registry.schemas import ModelSpec, ModelStatus
@@ -33,6 +36,55 @@ def test_model_registry_has_all_three_model_types_and_required_adapters() -> Non
         "random_forest_cashgap",
     } <= set(by_id)
     assert by_id["chronos_2"].plugin != by_id["chronos_bolt_tiny"].plugin
+    assert by_id["chronos_bolt_tiny"].bundled is True
+
+
+def test_missing_lightgbm_is_reported_instead_of_claiming_installed(monkeypatch) -> None:
+    spec = get_model_spec("lightgbm_cashgap")
+    assert spec
+    original_find_spec = importlib.util.find_spec
+
+    def fake_find_spec(name: str, package=None):
+        return None if name == "lightgbm" else original_find_spec(name, package)
+
+    monkeypatch.setattr(importlib.util, "find_spec", fake_find_spec)
+    report = create_model_plugin(spec).check_environment()
+    assert report.status == ModelStatus.NOT_INSTALLED
+    assert report.installed is False
+    assert "requirements-lightgbm.txt" in (report.install_command or "")
+
+
+def test_duplicate_model_install_reuses_active_job(monkeypatch) -> None:
+    monkeypatch.setattr(
+        models_api,
+        "list_jobs",
+        lambda: [
+            {
+                "id": "job_existing",
+                "job_type": "model_install",
+                "status": "installing",
+                "options": {"model_id": "chronos_bolt_small"},
+            }
+        ],
+    )
+
+    def fail_if_created(*args, **kwargs):
+        raise AssertionError("a duplicate installation job must not be created")
+
+    monkeypatch.setattr(models_api, "create_job", fail_if_created)
+    result = models_api.install("chronos_bolt_small")
+    assert result == {"job_id": "job_existing", "model_id": "chronos_bolt_small", "status": "installing"}
+
+
+def test_bundled_model_cannot_be_uninstalled() -> None:
+    spec = get_model_spec("chronos_bolt_tiny")
+    assert spec
+    try:
+        uninstall_model(spec)
+    except RuntimeError as error:
+        assert "Bundled offline model" in str(error)
+    else:
+        raise AssertionError("bundled model uninstall must be rejected")
 
 
 def test_optional_dependencies_return_explicit_environment_status() -> None:
@@ -100,17 +152,25 @@ def test_pretrained_install_is_revision_pinned_and_marks_only_complete_snapshots
             assert model_id == "example/safe-model"
             return Info()
 
+    attempts = 0
+
     def fake_snapshot_download(**kwargs):
+        nonlocal attempts
+        attempts += 1
         assert kwargs["revision"] == "fixed-revision-123"
         assert "*.safetensors" in kwargs["allow_patterns"]
         assert "*.bin" in kwargs["ignore_patterns"]
+        if attempts == 1:
+            raise ConnectionError("transient proxy failure")
         root = Path(kwargs["local_dir"])
         (root / "config.json").write_text("{}", encoding="utf-8")
         (root / "model.safetensors").write_bytes(b"safe")
 
     monkeypatch.setattr(huggingface_hub, "HfApi", FakeApi)
     monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+    monkeypatch.setattr(model_installer.time, "sleep", lambda _: None)
     result = install_pretrained(spec)
+    assert attempts == 2
     assert result["installed"] is True
     assert result["revision"] == "fixed-revision-123"
     assert not list(Path(result["path"]).rglob("*.bin"))

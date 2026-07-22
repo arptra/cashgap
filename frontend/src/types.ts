@@ -147,6 +147,7 @@ export interface ModelDefinition {
   supports_zero_shot?: boolean
   supports_multivariate?: boolean
   supports_covariates?: boolean
+  bundled?: boolean
   environment: ModelEnvironment
 }
 

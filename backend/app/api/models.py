@@ -5,7 +5,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Response, status
 from pydantic import BaseModel, Field
 
-from app.jobs.manager import create_job
+from app.jobs.manager import create_job, list_jobs
 from app.model_plugins import create_model_plugin
 from app.models_registry.registry import get_model, get_model_spec, list_models
 from app.services.benchmarks import benchmark_job, create_benchmark
@@ -55,6 +55,19 @@ def install(model_id: str) -> dict[str, str]:
     if spec is None:
         raise HTTPException(status_code=404, detail="Model not found")
 
+    active_job = next(
+        (
+            job
+            for job in list_jobs()
+            if job["job_type"] == "model_install"
+            and job["status"] in {"queued", "installing"}
+            and job["options"].get("model_id") == model_id
+        ),
+        None,
+    )
+    if active_job:
+        return {"job_id": active_job["id"], "model_id": model_id, "status": active_job["status"]}
+
     def installation(job_id, cancel_event):
         from app.jobs.manager import update_job
 
@@ -70,6 +83,8 @@ def uninstall(model_id: str) -> Response:
     spec = get_model_spec(model_id)
     if spec is None:
         raise HTTPException(status_code=404, detail="Model not found")
+    if spec.bundled:
+        raise HTTPException(status_code=409, detail="Bundled offline model cannot be removed")
     create_model_plugin(spec).uninstall()
     return Response(status_code=204)
 

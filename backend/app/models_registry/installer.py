@@ -4,10 +4,10 @@ import json
 import os
 import shutil
 import subprocess
-import tempfile
 import threading
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from app.config import COMPETITION_SOURCES_DIR, MODEL_CACHE_DIR
 from app.models_registry.schemas import ModelSpec
@@ -15,6 +15,22 @@ from app.models_registry.schemas import ModelSpec
 
 SAFE_WEIGHT_PATTERNS = ["*.json", "*.safetensors", "*.txt", "*.model", "*.spm", "*.py"]
 BLOCKED_WEIGHT_PATTERNS = ["*.bin", "*.pt", "*.pth", "*.pkl", "*.pickle", "*.joblib"]
+
+
+def _retry_hub_call(action: Callable[[], Any], cancel_event: threading.Event | None = None) -> Any:
+    try:
+        attempts = max(1, int(os.getenv("CASHGAP_HF_DOWNLOAD_ATTEMPTS", "4")))
+    except ValueError:
+        attempts = 4
+    for attempt in range(attempts):
+        if cancel_event and cancel_event.is_set():
+            raise RuntimeError("Model installation cancelled")
+        try:
+            return action()
+        except Exception:
+            if attempt + 1 >= attempts:
+                raise
+            time.sleep(min(2**attempt, 15))
 
 
 def model_install_dir(spec: ModelSpec) -> Path:
@@ -44,22 +60,29 @@ def install_pretrained(spec: ModelSpec, cancel_event: threading.Event | None = N
     from huggingface_hub import HfApi, snapshot_download
 
     token = os.getenv("HF_TOKEN") or None
-    info = HfApi(token=token).model_info(spec.model_id)
+    info = _retry_hub_call(lambda: HfApi(token=token).model_info(spec.model_id), cancel_event)
     revision = info.sha
     root = model_install_dir(spec)
     root.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=f".{spec.id}-", dir=root.parent))
+    staging = root.parent / f".{spec.id}-{revision}.partial"
+    for stale_staging in root.parent.glob(f".{spec.id}-*.partial"):
+        if stale_staging != staging:
+            shutil.rmtree(stale_staging, ignore_errors=True)
+    staging.mkdir(parents=True, exist_ok=True)
     if cancel_event and cancel_event.is_set():
         shutil.rmtree(staging, ignore_errors=True)
         raise RuntimeError("Model installation cancelled")
     try:
-        snapshot_download(
-            repo_id=spec.model_id,
-            revision=revision,
-            token=token,
-            local_dir=staging,
-            allow_patterns=SAFE_WEIGHT_PATTERNS,
-            ignore_patterns=BLOCKED_WEIGHT_PATTERNS,
+        _retry_hub_call(
+            lambda: snapshot_download(
+                repo_id=spec.model_id,
+                revision=revision,
+                token=token,
+                local_dir=staging,
+                allow_patterns=SAFE_WEIGHT_PATTERNS,
+                ignore_patterns=BLOCKED_WEIGHT_PATTERNS,
+            ),
+            cancel_event,
         )
         if cancel_event and cancel_event.is_set():
             raise RuntimeError("Model installation cancelled")
@@ -75,7 +98,10 @@ def install_pretrained(spec: ModelSpec, cancel_event: threading.Event | None = N
             shutil.rmtree(root)
         staging.replace(root)
     except Exception:
-        shutil.rmtree(staging, ignore_errors=True)
+        # Keep partial downloads so a user retry resumes instead of losing
+        # hundreds of megabytes after a transient proxy/DNS interruption.
+        if cancel_event and cancel_event.is_set():
+            shutil.rmtree(staging, ignore_errors=True)
         raise
     return cache_metadata(spec)
 
@@ -132,6 +158,8 @@ def install_model(spec: ModelSpec, cancel_event: threading.Event | None = None) 
 
 
 def uninstall_model(spec: ModelSpec) -> None:
+    if spec.bundled:
+        raise RuntimeError("Bundled offline model cannot be removed")
     root = model_install_dir(spec).resolve()
     allowed = {MODEL_CACHE_DIR.resolve(), COMPETITION_SOURCES_DIR.resolve()}
     if not any(root.is_relative_to(parent) for parent in allowed):

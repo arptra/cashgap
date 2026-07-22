@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { datasetApi, errorMessage, modelApi } from '../api'
@@ -33,6 +33,8 @@ function ModelCard({ model, datasetId, compared, toggle, installJob }: { model: 
   const configure = () => navigate(`/run?model=${encodeURIComponent(model.id)}`)
   const error = check.error || install.error || remove.error || compatibility.error
   const isCompetition = model.type === 'competition_recipe'
+  const isInstalling = model.environment.status === 'INSTALLING' || installJob?.status === 'queued' || installJob?.status === 'installing'
+  const isReady = model.environment.installed && model.environment.dependency_installed
   return <article className={`model-card model-card--${model.type}`}>
     <div className="card-top"><div><p className="eyebrow">{typeNames[model.type]}</p><h2>{model.name}</h2></div><StatusBadge status={model.environment.status} /></div>
     <p className="model-description">{model.description}</p>
@@ -46,14 +48,14 @@ function ModelCard({ model, datasetId, compared, toggle, installJob }: { model: 
     {model.source_url && <a className="source-link" href={model.source_url} target="_blank" rel="noreferrer">Открыть источник ↗</a>}
     <div className="model-actions">
       <button className="button button--secondary" onClick={() => check.mutate()}>Проверить окружение</button>
-      {!isCompetition && !model.environment.weights_cached && model.type === 'pretrained_model' && <button className="button" onClick={() => install.mutate()}>Установить</button>}
-      {!isCompetition && model.environment.weights_cached && <button className="text-button danger" onClick={() => remove.mutate()}>Удалить веса</button>}
+      {!isCompetition && !model.environment.weights_cached && model.type === 'pretrained_model' && <button className="button" disabled={isInstalling} onClick={() => install.mutate()}>{isInstalling ? 'Устанавливается…' : 'Установить'}</button>}
+      {!isCompetition && !model.bundled && model.environment.weights_cached && <button className="text-button danger" onClick={() => remove.mutate()}>Удалить веса</button>}
       <button className="button button--secondary" disabled={!datasetId} onClick={() => compatibility.refetch()}>Проверить совместимость</button>
       <button className="button button--secondary" onClick={configure}>Настроить</button>
-      {!isCompetition && <button className="button" onClick={configure}>{model.requires_training ? 'Обучить' : 'Запустить'}</button>}
-      <button className={`button ${compared ? '' : 'button--secondary'}`} onClick={toggle}>{compared ? 'В сравнении' : 'Добавить в сравнение'}</button>
+      {!isCompetition && <button className="button" disabled={!isReady} onClick={configure}>{model.requires_training ? 'Обучить' : 'Запустить'}</button>}
+      <button className={`button ${compared ? '' : 'button--secondary'}`} disabled={!isReady} onClick={toggle}>{compared ? 'В сравнении' : 'Добавить в сравнение'}</button>
     </div>
-    {isCompetition && <div className="recipe-actions"><button className="button" onClick={() => install.mutate()}>Подключить решение</button><button className="button button--secondary" onClick={() => install.mutate()}>Получить исходный notebook</button><button className="button" onClick={configure}>Обучить на моих данных</button></div>}
+    {isCompetition && <div className="recipe-actions"><button className="button" disabled={isInstalling} onClick={() => install.mutate()}>Подключить решение</button><button className="button button--secondary" disabled={isInstalling} onClick={() => install.mutate()}>Получить исходный notebook</button><button className="button" disabled={!isReady} onClick={configure}>Обучить на моих данных</button></div>}
     {model.environment.install_command && !model.environment.dependency_installed && <pre className="install-command">{model.environment.install_command}</pre>}
     {error && <p className="error-message">{errorMessage(error)}</p>}
   </article>
@@ -69,6 +71,16 @@ export default function ModelsPage() {
   const [filter, setFilter] = useState('all')
   const [compared, setCompared] = useState<string[]>(() => JSON.parse(localStorage.getItem('cashgap_compare_models') || '[]'))
   const visible = useMemo(() => models.data?.filter((model) => filter === 'all' || model.type === filter) ?? [], [models.data, filter])
+  useEffect(() => {
+    if (!models.data) return
+    const readyIds = new Set(models.data.filter((model) => model.environment.installed && model.environment.dependency_installed).map((model) => model.id))
+    setCompared((current) => {
+      const next = current.filter((id) => readyIds.has(id))
+      if (next.length === current.length) return current
+      localStorage.setItem('cashgap_compare_models', JSON.stringify(next))
+      return next
+    })
+  }, [models.data])
   const toggle = (id: string) => setCompared((current) => { const next = current.includes(id) ? current.filter((item) => item !== id) : [...current, id]; localStorage.setItem('cashgap_compare_models', JSON.stringify(next)); return next })
   return <>
     <PageHeader eyebrow="Model-first workspace" title="Модели и решения" text="Готовые модели, решения соревнований и локальные алгоритмы для прогнозирования денежных потоков и риска кассового разрыва." />

@@ -38,6 +38,7 @@ class ModelSpec(BaseModel):
     supports_zero_shot: bool = False
     supports_multivariate: bool = False
     supports_covariates: bool = False
+    bundled: bool = False
     limitations: list[str] = Field(default_factory=list)
 
 
