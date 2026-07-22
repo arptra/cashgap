@@ -94,7 +94,9 @@ def _lightgbm_forecast(train: pd.DataFrame, horizon: int, params: dict[str, Any]
     try:
         from lightgbm import LGBMRegressor
     except ImportError as exc:
-        raise RuntimeError("LightGBM is not installed. Run make setup.") from exc
+        raise RuntimeError(
+            "LightGBM is optional and is not installed. Install backend/requirements-lightgbm.txt if your package index allows it."
+        ) from exc
     lags = (1, 2, 3, 6)
     values = train["y"].astype(float).tolist()
     rows, targets = [], []
@@ -151,4 +153,3 @@ def train_forecaster(model_name: str, series: pd.DataFrame, params: dict[str, An
     )
     metrics = forecasting_metrics(train["y"].to_numpy(float), test["y"].to_numpy(float), forecast, seconds)
     return ForecastResult(model=model, predictions=predictions, metrics=metrics, parameters=effective)
-

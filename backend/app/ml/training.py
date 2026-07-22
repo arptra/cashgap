@@ -76,7 +76,9 @@ def create_model(model_name: str, params: dict[str, Any], random_seed: int = 42)
         try:
             from lightgbm import LGBMClassifier
         except ImportError as exc:
-            raise RuntimeError("LightGBM is not installed. Run make setup.") from exc
+            raise RuntimeError(
+                "LightGBM is optional and is not installed. Install backend/requirements-lightgbm.txt if your package index allows it."
+            ) from exc
         effective = {
             "n_estimators": 400,
             "learning_rate": 0.04,
@@ -156,4 +158,3 @@ def train_and_evaluate(
         training_seconds=training_seconds,
         effective_params=effective_params,
     )
-

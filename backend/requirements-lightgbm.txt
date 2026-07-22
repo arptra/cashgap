@@ -1,0 +1,2 @@
+# Optional: the application starts without LightGBM when a corporate index blocks it.
+lightgbm==4.7.0
