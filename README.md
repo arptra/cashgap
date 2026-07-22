@@ -47,9 +47,12 @@ Supervised-классификация разрешена только когда
 ## Быстрый старт
 
 ```bash
-make setup
-make dev
+git clone https://github.com/arptra/cashgap.git
+cd cashgap
+python3 start.py
 ```
+
+`start.py` сам создаёт `.venv`, устанавливает Python- и Node.js-зависимости и запускает FastAPI вместе с Vite. `make` не нужен. При следующих запусках достаточно снова выполнить `python3 start.py`.
 
 Адреса по умолчанию:
 
@@ -57,10 +60,10 @@ make dev
 - Swagger: <http://127.0.0.1:8000/docs>
 - health: <http://127.0.0.1:8000/api/health>
 
-`make dev` запускает Uvicorn и Vite, а по Ctrl+C завершает оба процесса. Если порт занят, скрипт выберет следующий свободный и напечатает фактический URL. Порты можно задать явно:
+`python3 start.py` запускает Uvicorn и Vite, а по Ctrl+C завершает оба процесса. Если порт занят, скрипт выберет следующий свободный и напечатает фактический URL. Порты можно задать явно:
 
 ```bash
-CASHGAP_API_PORT=8010 CASHGAP_UI_PORT=5174 make dev
+CASHGAP_API_PORT=8010 CASHGAP_UI_PORT=5174 python3 start.py
 ```
 
 `make setup` автоматически выбирает существующий `.venv`, затем `python3.13`, `python3.12` или `python3.11`. Если совместимый Python доступен под другим именем:
@@ -73,8 +76,18 @@ PYTHON_BIN=/usr/bin/python3.11 make setup
 
 ```bash
 git pull
-make setup
-make dev
+python3 start.py
+```
+
+Для ручного запуска в двух терминалах после первой установки:
+
+```bash
+# Терминал 1 — backend
+.venv/bin/python -m uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8000
+
+# Терминал 2 — frontend
+cd frontend
+npm run dev
 ```
 
 ## Демо целиком

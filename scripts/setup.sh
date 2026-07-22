@@ -55,4 +55,4 @@ echo "[2/3] Installing backend dependencies"
 echo "[3/3] Installing frontend dependencies"
 npm --prefix "$PROJECT_DIR/frontend" install
 
-echo "CashGap Lab is ready. Run: make dev"
+echo "CashGap Lab is ready. Run: python3 start.py"

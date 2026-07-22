@@ -5,7 +5,7 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 API_PORT="${CASHGAP_API_PORT:-8000}"
 UI_PORT="${CASHGAP_UI_PORT:-5173}"
 if [[ ! -x "$PROJECT_DIR/.venv/bin/uvicorn" || ! -d "$PROJECT_DIR/frontend/node_modules" ]]; then
-  echo "Dependencies are missing. Run make setup first." >&2
+  echo "Dependencies are missing. Run python3 start.py from the repository root." >&2
   exit 1
 fi
 
