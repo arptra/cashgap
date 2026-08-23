@@ -19,6 +19,7 @@ several rolling validation months. The final holdout months are excluded.
 from __future__ import annotations
 
 import argparse
+import gc
 import importlib.util
 import json
 import os
@@ -67,9 +68,10 @@ import numpy as np
 import pandas as pd
 
 try:
-    from experiments.train_cashflow_proxy import build_daily
+    from experiments.train_cashflow_proxy import build_observed_daily
     from experiments.benchmark_monthly_cashflow import (
         build_monthly_dataset,
+        materialize_fold,
         predict_boosting,
         predict_torch_mlp,
         regression_metrics,
@@ -77,9 +79,10 @@ try:
         target_matrix,
     )
 except ImportError:
-    from train_cashflow_proxy import build_daily
+    from train_cashflow_proxy import build_observed_daily
     from benchmark_monthly_cashflow import (
         build_monthly_dataset,
+        materialize_fold,
         predict_boosting,
         predict_torch_mlp,
         regression_metrics,
@@ -143,8 +146,8 @@ def score_prediction(actual: np.ndarray, predicted: np.ndarray, zero_floor: floa
 
 
 def mlp_layers(trial) -> List[int]:
-    count = trial.suggest_int("n_layers", 1, 4)
-    first = trial.suggest_categorical("first_width", [64, 128, 256, 512, 1024])
+    count = trial.suggest_int("n_layers", 1, 6)
+    first = trial.suggest_categorical("first_width", [64, 128, 256, 512, 1024, 2048])
     shrink = trial.suggest_categorical("width_shrink", [0.5, 0.75, 1.0])
     return [max(32, int(first * (shrink ** index))) for index in range(count)]
 
@@ -164,12 +167,17 @@ def main() -> None:
 
     random.seed(args.seed)
     np.random.seed(args.seed)
-    output = Path(args.output_dir) / args.model
+    output_root = Path(args.output_dir)
+    output = output_root if output_root.name == args.model else output_root / args.model
     output.mkdir(parents=True, exist_ok=True)
-    daily = build_daily(args)
-    monthly, features = build_monthly_dataset(daily)
+    observed_daily = build_observed_daily(args)
+    monthly, features = build_monthly_dataset(observed_daily)
+    del observed_daily
     tuning_frame = tuning_frame_without_holdout(monthly, args.holdout_test_periods)
-    folds = rolling_month_folds(tuning_frame, args.tuning_periods, args.min_train_months)
+    fold_specs = rolling_month_folds(tuning_frame, args.tuning_periods, args.min_train_months)
+    folds = [materialize_fold(tuning_frame, fold, features) for fold in fold_specs]
+    del monthly, tuning_frame
+    gc.collect()
     devices = resolve_devices(args.devices) if args.model == "mlp" else ["cpu"]
     total_cpus = max(1, os.cpu_count() or 1)
     per_trial_jobs = args.cpu_threads or max(1, total_cpus // max(1, args.jobs))
@@ -209,9 +217,9 @@ def main() -> None:
             train = fold["train"]
             valid = fold["valid"]
             test = fold["test"]
-            X_train = train[features].fillna(0.0)
-            X_valid = valid[features].fillna(0.0)
-            X_test = test[features].fillna(0.0)
+            X_train = fold["X_train"]
+            X_valid = fold["X_valid"]
+            X_test = fold["X_test"]
             try:
                 if args.model == "mlp":
                     prediction = predict_torch_mlp(

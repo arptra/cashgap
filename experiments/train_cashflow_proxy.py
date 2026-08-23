@@ -183,7 +183,8 @@ def normalize(path: str, inn_column: str, value_name: str) -> pd.DataFrame:
     return frame.groupby(["inn", "date"], as_index=False)[value_name].sum()
 
 
-def build_daily(args: argparse.Namespace) -> pd.DataFrame:
+def build_observed_daily(args: argparse.Namespace) -> pd.DataFrame:
+    """Load one row per INN/transaction day without filling inactive dates."""
     if not args.outflow or not args.inflow:
         raise ValueError("Training requires both --outflow and --inflow parquet paths.")
     outflow = normalize(args.outflow, "dt_inn", "outflow")
@@ -192,6 +193,14 @@ def build_daily(args: argparse.Namespace) -> pd.DataFrame:
     if args.max_inns:
         selected = daily["inn"].value_counts().head(args.max_inns).index
         daily = daily[daily["inn"].isin(selected)]
+    if daily.empty:
+        raise ValueError("No valid transactions were found in the parquet files.")
+    daily["net_flow"] = daily["inflow"] - daily["outflow"]
+    return daily.sort_values(["inn", "date"]).reset_index(drop=True)
+
+
+def build_daily(args: argparse.Namespace) -> pd.DataFrame:
+    daily = build_observed_daily(args)
 
     parts = []
     for inn, group in daily.groupby("inn", sort=False):

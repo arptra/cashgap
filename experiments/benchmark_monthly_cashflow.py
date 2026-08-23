@@ -21,11 +21,13 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import gc
 import importlib.util
 import json
 import math
 import os
 import random
+import resource
 import shlex
 import sys
 import time
@@ -77,9 +79,9 @@ from sklearn.preprocessing import StandardScaler
 from threadpoolctl import threadpool_limits
 
 try:
-    from experiments.train_cashflow_proxy import build_daily
+    from experiments.train_cashflow_proxy import build_observed_daily
 except ImportError:
-    from train_cashflow_proxy import build_daily
+    from train_cashflow_proxy import build_observed_daily
 
 
 TARGET_COLUMNS = ["target_inflow", "target_outflow"]
@@ -91,6 +93,12 @@ MODEL_NAMES = (
     "torch_mlp_3_layers",
     "torch_mlp_tuned",
 )
+
+
+def peak_rss_gib() -> float:
+    value = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    # Linux reports KiB; macOS reports bytes.
+    return value / (1024 ** 3) if sys.platform == "darwin" else value / (1024 ** 2)
 
 
 def parse_args() -> argparse.Namespace:
@@ -107,6 +115,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=32768)
     parser.add_argument("--mlp2-device", default="auto")
     parser.add_argument("--mlp3-device", default="auto")
+    parser.add_argument("--mlp2-layers", default="128,64", help="Comma-separated hidden widths")
+    parser.add_argument("--mlp3-layers", default="256,128,64", help="Comma-separated hidden widths")
     parser.add_argument("--parallel", action="store_true")
     parser.add_argument("--cpu-threads", type=int, default=None)
     parser.add_argument("--boosting-iterations", type=int, default=250)
@@ -117,7 +127,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_monthly_dataset(daily: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
-    """Create point-in-time monthly features; current month is target only."""
+    """Create point-in-time monthly features without a memory-heavy daily grid."""
     values = daily.copy()
     global_first_date = pd.Timestamp(values["date"].min()).normalize()
     global_last_date = pd.Timestamp(values["date"].max()).normalize()
@@ -132,6 +142,27 @@ def build_monthly_dataset(daily: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]
         active_outflow_days=("active_outflow", "sum"),
         negative_days=("negative_day", "sum"),
     )
+    observed_rows = len(monthly)
+    # Keep zero-activity calendar months, but expand only at month granularity.
+    # The old daily expansion could turn sparse transactions into billions of
+    # rows before they were immediately aggregated back to months.
+    bounds = monthly.groupby("inn", as_index=False)["month"].agg(start_month="min", end_month="max")
+    all_months = pd.date_range(monthly["month"].min(), monthly["month"].max(), freq="MS")
+    grid = pd.MultiIndex.from_product(
+        [bounds["inn"].astype("string"), all_months], names=["inn", "month"]
+    ).to_frame(index=False)
+    grid = grid.merge(bounds, on="inn", how="left", validate="many_to_one")
+    grid = grid[
+        grid["month"].ge(grid["start_month"]) & grid["month"].le(grid["end_month"])
+    ][["inn", "month"]]
+    monthly = grid.merge(monthly, on=["inn", "month"], how="left", validate="one_to_one")
+    amount_columns = ["target_inflow", "target_outflow"]
+    activity_columns = ["active_inflow_days", "active_outflow_days", "negative_days"]
+    monthly[amount_columns] = monthly[amount_columns].fillna(0.0)
+    monthly[activity_columns] = monthly[activity_columns].fillna(0).astype(np.int16)
+    print("Monthly grid | observed rows: {:,} | with inactive months: {:,}".format(
+        observed_rows, len(monthly)
+    ))
     monthly["target_net_flow"] = monthly["target_inflow"] - monthly["target_outflow"]
     first_month = global_first_date.to_period("M").to_timestamp()
     last_month = global_last_date.to_period("M").to_timestamp()
@@ -182,6 +213,7 @@ def build_monthly_dataset(daily: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]
 def rolling_month_folds(
     frame: pd.DataFrame, test_periods: int, min_train_months: int,
 ) -> List[Dict[str, object]]:
+    """Return lightweight time boundaries; fold DataFrames are built lazily."""
     months = [pd.Timestamp(value) for value in sorted(frame["month"].unique())]
     if len(months) < min_train_months + test_periods + 1:
         raise ValueError(
@@ -196,10 +228,10 @@ def rolling_month_folds(
         train_months = months[:position - 1]
         if len(train_months) < min_train_months:
             continue
-        train = frame[frame["month"].isin(train_months)].copy()
-        valid = frame[frame["month"].eq(validation_month)].copy()
-        test = frame[frame["month"].eq(test_month)].copy()
-        if min(len(train), len(valid), len(test)) == 0:
+        train_rows = int(frame["month"].isin(train_months).sum())
+        validation_rows = int(frame["month"].eq(validation_month).sum())
+        test_rows = int(frame["month"].eq(test_month).sum())
+        if min(train_rows, validation_rows, test_rows) == 0:
             continue
         folds.append({
             "fold": fold_index,
@@ -207,13 +239,34 @@ def rolling_month_folds(
             "train_end": train_months[-1],
             "validation_month": validation_month,
             "test_month": test_month,
-            "train": train,
-            "valid": valid,
-            "test": test,
+            "train_rows": train_rows,
+            "validation_rows": validation_rows,
+            "test_rows": test_rows,
         })
     if len(folds) != test_periods:
         raise ValueError("Could build only {} of {} requested folds.".format(len(folds), test_periods))
     return folds
+
+
+def materialize_fold(
+    frame: pd.DataFrame, fold: Dict[str, object], features: Sequence[str],
+) -> Dict[str, object]:
+    """Build one fold and one shared float32 feature matrix per split."""
+    materialized = dict(fold)
+    validation_month = pd.Timestamp(fold["validation_month"])
+    test_month = pd.Timestamp(fold["test_month"])
+    train = frame[frame["month"].lt(validation_month)].copy()
+    valid = frame[frame["month"].eq(validation_month)].copy()
+    test = frame[frame["month"].eq(test_month)].copy()
+    materialized.update({
+        "train": train,
+        "valid": valid,
+        "test": test,
+        "X_train": train[list(features)].fillna(0.0).astype(np.float32, copy=False),
+        "X_valid": valid[list(features)].fillna(0.0).astype(np.float32, copy=False),
+        "X_test": test[list(features)].fillna(0.0).astype(np.float32, copy=False),
+    })
+    return materialized
 
 
 def target_matrix(frame: pd.DataFrame) -> np.ndarray:
@@ -314,6 +367,10 @@ def predict_torch_mlp(
         width = int(hidden)
     modules.append(nn.Linear(width, 2))
     model = nn.Sequential(*modules).to(device)
+    parameter_count = sum(parameter.numel() for parameter in model.parameters())
+    print("    {} | layers={} | rows={:,} | batch={:,} | parameters={:,}".format(
+        device, list(layers), len(x_train), batch_size, parameter_count
+    ))
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=float(options["learning_rate"]),
         weight_decay=float(options["weight_decay"]),
@@ -382,6 +439,11 @@ def resolve_devices(mlp2: str, mlp3: str, parallel: bool) -> Tuple[str, str]:
 
     result = resolve(mlp2, 0), resolve(mlp3, 1)
     print("PyTorch GPU count: {} | MLP-2: {} | MLP-3: {}".format(count, result[0], result[1]))
+    for index in sorted({int(item.split(":", 1)[1]) for item in result if item.startswith("cuda:")}):
+        properties = torch.cuda.get_device_properties(index)
+        print("  cuda:{} | {} | {:.1f} GiB".format(
+            index, properties.name, properties.total_memory / (1024 ** 3)
+        ))
     return result
 
 
@@ -420,15 +482,15 @@ def regression_metrics(
 
 
 def run_model(
-    name: str, fold: Dict[str, object], features: List[str], args: argparse.Namespace,
+    name: str, fold: Dict[str, object], args: argparse.Namespace,
     devices: Tuple[str, str], jobs: int,
 ) -> Tuple[np.ndarray, float]:
     train = fold["train"]
     valid = fold["valid"]
     test = fold["test"]
-    X_train = train[features].fillna(0.0)
-    X_valid = valid[features].fillna(0.0)
-    X_test = test[features].fillna(0.0)
+    X_train = fold["X_train"]
+    X_valid = fold["X_valid"]
+    X_test = fold["X_test"]
     started = time.perf_counter()
     if name == "trailing_mean":
         prediction = predict_trailing_mean(test)
@@ -441,12 +503,12 @@ def run_model(
         )
     elif name == "torch_mlp_2_layers":
         prediction = predict_torch_mlp(
-            (128, 64), X_train, train, X_valid, valid, X_test,
+            args.mlp2_layers_parsed, X_train, train, X_valid, valid, X_test,
             devices[0], args.epochs, args.batch_size, args.seed,
         )
     elif name == "torch_mlp_3_layers":
         prediction = predict_torch_mlp(
-            (256, 128, 64), X_train, train, X_valid, valid, X_test,
+            args.mlp3_layers_parsed, X_train, train, X_valid, valid, X_test,
             devices[1], args.epochs, args.batch_size, args.seed,
         )
     elif name == "torch_mlp_tuned":
@@ -472,6 +534,16 @@ def validate_models(value: str) -> List[str]:
     return models
 
 
+def parse_layers(value: str, option: str) -> Tuple[int, ...]:
+    try:
+        layers = tuple(int(item.strip()) for item in value.split(",") if item.strip())
+    except ValueError as error:
+        raise ValueError("{} must contain comma-separated integers; got {!r}".format(option, value)) from error
+    if not layers or any(width < 1 for width in layers):
+        raise ValueError("{} must contain positive layer widths; got {!r}".format(option, value))
+    return layers
+
+
 def load_tuned_params(path: Optional[str], expected_model: str) -> Optional[Dict]:
     if not path:
         return None
@@ -488,6 +560,8 @@ def main() -> None:
     random.seed(args.seed)
     np.random.seed(args.seed)
     models = validate_models(args.models)
+    args.mlp2_layers_parsed = parse_layers(args.mlp2_layers, "--mlp2-layers")
+    args.mlp3_layers_parsed = parse_layers(args.mlp3_layers, "--mlp3-layers")
     if any(name.startswith("torch_") for name in models) and importlib.util.find_spec("torch") is None:
         raise SystemExit(
             "Selected Torch MLP models, but torch is missing. Install the CUDA command printed above, restart the kernel, and retry."
@@ -497,21 +571,38 @@ def main() -> None:
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
     print("\n=== MONTHLY CASH-FLOW BENCHMARK ===")
-    daily = build_daily(args)
-    monthly, features = build_monthly_dataset(daily)
-    folds = rolling_month_folds(monthly, args.test_periods, args.min_train_months)
+    observed_daily = build_observed_daily(args)
+    monthly, features = build_monthly_dataset(observed_daily)
+    del observed_daily
+    gc.collect()
+    fold_specs = rolling_month_folds(monthly, args.test_periods, args.min_train_months)
     devices = resolve_devices(args.mlp2_device, args.mlp3_device, args.parallel)
     total_cpus = max(1, os.cpu_count() or 1)
-    jobs = args.cpu_threads or (max(1, total_cpus // 2) if args.parallel else total_cpus)
+    jobs = args.cpu_threads or (max(1, total_cpus // 4) if args.parallel else total_cpus)
+    cpu_heavy_models = sum(name in {"linear_regression", "gradient_boosting"} for name in models)
+    estimated_cpu_threads = min(total_cpus, jobs * cpu_heavy_models)
     print("INNs: {:,} | months: {} | features: {} | folds: {}".format(
-        monthly["inn"].nunique(), monthly["month"].nunique(), len(features), len(folds)
+        monthly["inn"].nunique(), monthly["month"].nunique(), len(features), len(fold_specs)
+    ))
+    print("Peak process RAM after features: {:.2f} GiB".format(peak_rss_gib()))
+    print("Resources | CPU threads/model: {} | concurrent CPU target: ~{}/{} ({:.0f}%)".format(
+        jobs, estimated_cpu_threads, total_cpus, estimated_cpu_threads / total_cpus * 100
+    ))
+    print("GPU architectures | {}: {} | {}: {}".format(
+        devices[0], list(args.mlp2_layers_parsed), devices[1], list(args.mlp3_layers_parsed)
     ))
 
     metric_rows, prediction_rows, window_rows = [], [], []
-    for fold in folds:
+    for fold_spec in fold_specs:
+        fold = materialize_fold(monthly, fold_spec, features)
         fold_number = int(fold["fold"])
         test_month = pd.Timestamp(fold["test_month"])
-        print("\n--- Fold {}/{} | test {} ---".format(fold_number, len(folds), test_month.strftime("%Y-%m")))
+        print("\n--- Fold {}/{} | test {} ---".format(
+            fold_number, len(fold_specs), test_month.strftime("%Y-%m")
+        ))
+        print("Fold rows | train {:,} | valid {:,} | test {:,} | peak RAM {:.2f} GiB".format(
+            len(fold["train"]), len(fold["valid"]), len(fold["test"]), peak_rss_gib()
+        ))
         window_rows.append({
             "fold": fold_number,
             "train_start": fold["train_start"],
@@ -529,14 +620,14 @@ def main() -> None:
             # device each while CPU alternatives run alongside them.
             with concurrent.futures.ThreadPoolExecutor(max_workers=len(models)) as executor:
                 future_names = {
-                    executor.submit(run_model, name, fold, features, args, devices, jobs): name
+                    executor.submit(run_model, name, fold, args, devices, jobs): name
                     for name in models
                 }
                 for future in concurrent.futures.as_completed(future_names):
                     results[future_names[future]] = future.result()
         else:
             for name in models:
-                results[name] = run_model(name, fold, features, args, devices, jobs)
+                results[name] = run_model(name, fold, args, devices, jobs)
 
         actual = target_matrix(fold["test"])
         for name in models:
@@ -563,6 +654,8 @@ def main() -> None:
             print("  {:24s} | credit MAPE {:6.2f}% | debit MAPE {:6.2f}% | {:.1f}s".format(
                 name, primary[0]["aggregate_mape_percent"], primary[1]["aggregate_mape_percent"], seconds
             ))
+        del results, fold
+        gc.collect()
 
     metrics = pd.DataFrame(metric_rows)
     predictions = pd.concat(prediction_rows, ignore_index=True)
@@ -583,7 +676,7 @@ def main() -> None:
     config = vars(args).copy()
     config["features"] = features
     (output / "run_config.json").write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
-    print("\n=== STABILITY OVER {} TEST MONTHS ===".format(len(folds)))
+    print("\n=== STABILITY OVER {} TEST MONTHS ===".format(len(fold_specs)))
     print(summary.to_string(index=False))
     print("\nSaved to {}".format(output.resolve()))
 

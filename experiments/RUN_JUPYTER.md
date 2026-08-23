@@ -145,6 +145,36 @@ print(pq.read_schema(INFLOW))
 - `monthly_predictions.parquet` — факт и прогноз по каждому ИНН;
 - `run_config.json` — параметры запуска.
 
+### Full-parallel профиль: 64 CPU, 500 ГБ RAM, две GPU по 40 ГБ
+
+Этот профиль использует все модели одновременно, выделяет CPU-моделям до 12
+потоков каждой и делает обе MLP достаточно широкими для полезной нагрузки GPU.
+Месячные признаки разделяются между моделями в RAM, а folds создаются по одному.
+
+```python
+%run experiments/benchmark_monthly_cashflow.py \
+  --outflow "/data/outflow.parquet" \
+  --inflow "/data/inflow.parquet" \
+  --output-dir "./artifacts/monthly_benchmark_full_parallel" \
+  --models trailing_mean,linear_regression,gradient_boosting,torch_mlp_2_layers,torch_mlp_3_layers \
+  --test-periods 10 \
+  --min-train-months 12 \
+  --epochs 150 \
+  --batch-size 32768 \
+  --boosting-iterations 500 \
+  --cpu-threads 12 \
+  --parallel \
+  --mlp2-device cuda:0 \
+  --mlp3-device cuda:1 \
+  --mlp2-layers 2048,1024 \
+  --mlp3-layers 2048,1536,768
+```
+
+В начале запуска лог печатает реальное распределение ресурсов, архитектуры,
+число строк, размер batch и количество параметров. Минимальный процент загрузки
+GPU нельзя гарантировать независимо от числа строк, но эти настройки увеличивают
+полезные матричные вычисления, не добавляя искусственный stress-нагрев.
+
 ## 7. Посмотреть результаты базового обучения
 
 Итоговый рейтинг моделей:
@@ -209,6 +239,24 @@ artifacts/cashflow_tuning/mlp/best_params.json
 
 Повторный запуск той же команды продолжает существующее Optuna study и добавляет
 ещё указанное количество trials.
+
+Для указанной конфигурации можно проводить более широкий поиск до шести слоёв и
+2048 нейронов в первом слое, запуская примерно четыре trials на каждой GPU:
+
+```python
+%run experiments/autotune_cashflow.py \
+  --model mlp \
+  --outflow "/data/outflow.parquet" \
+  --inflow "/data/inflow.parquet" \
+  --output-dir "./artifacts/cashflow_tuning_full" \
+  --trials 100 \
+  --jobs 8 \
+  --devices cuda:0,cuda:1 \
+  --tuning-periods 3 \
+  --holdout-test-periods 10 \
+  --min-train-months 12 \
+  --epochs 120
+```
 
 ## 9. Автотюнинг gradient boosting
 
