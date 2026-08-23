@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List
 
 import pandas as pd
 import pyarrow as pa
@@ -158,6 +158,189 @@ def _business_conclusion(summary: pd.DataFrame, periods: int) -> str:
     return "\n".join(lines)
 
 
+def _number(value: object, digits: int = 2, sign: bool = False) -> str:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return "н/д"
+    if pd.isna(numeric):
+        return "н/д"
+    pattern = "{:+." + str(digits) + "f}" if sign else "{:." + str(digits) + "f}"
+    return pattern.format(numeric)
+
+
+def _markdown_table(headers: List[str], rows: List[List[str]]) -> List[str]:
+    result = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join(["---"] * len(headers)) + " |",
+    ]
+    result.extend("| " + " | ".join(str(value) for value in row) + " |" for row in rows)
+    return result
+
+
+def _markdown_summary(
+    metrics: pd.DataFrame,
+    summary: pd.DataFrame,
+    windows: pd.DataFrame,
+) -> str:
+    periods = int(windows["fold"].nunique()) if not windows.empty else 0
+    test_start = pd.to_datetime(windows["test_month"]).min() if not windows.empty else None
+    test_end = pd.to_datetime(windows["test_month"]).max() if not windows.empty else None
+    train_start = pd.to_datetime(windows["train_start"]).min() if not windows.empty else None
+    train_end = pd.to_datetime(windows["train_end"]).max() if not windows.empty else None
+
+    overall = summary.groupby("model", as_index=False).agg(
+        mean_mape=("aggregate_mape_mean_percent", "mean"),
+        worst_mape=("aggregate_mape_worst_percent", "max"),
+        mean_wape=("wape_mean_percent", "mean"),
+        mean_company_mape=("company_mape_mean_percent", "mean"),
+    ).sort_values("mean_mape")
+    overall_winner = overall.iloc[0] if not overall.empty else None
+
+    lines = [
+        "# Краткий отчёт по прогнозу денежных потоков",
+        "",
+        "## Что прогнозирует модель",
+        "",
+        "Для каждого ИНН модель прогнозирует **общую сумму зачислений** и "
+        "**общую сумму списаний** за календарный месяц. Чистый денежный поток "
+        "рассчитывается как `зачисления − списания`.",
+        "",
+        "> Это прогноз денежных потоков, а не кассового разрыва. Чтобы определить "
+        "кассовый разрыв, дополнительно нужны остаток денег на начало периода, "
+        "обязательные платежи и доступные кредитные лимиты.",
+        "",
+        "## Как проводилась проверка",
+        "",
+        "- Тестовых месяцев: **{}**.".format(periods),
+    ]
+    if test_start is not None and test_end is not None:
+        lines.append("- Тестовый диапазон: **{} — {}**.".format(
+            test_start.strftime("%Y-%m"), test_end.strftime("%Y-%m")
+        ))
+    if train_start is not None and train_end is not None:
+        lines.append("- История обучения в разных folds: **{} — {}**.".format(
+            train_start.strftime("%Y-%m"), train_end.strftime("%Y-%m")
+        ))
+    lines.extend([
+        "- Для каждого тестового месяца модель видела только предыдущие месяцы. "
+        "Будущий тестовый месяц в обучение не попадал.",
+        "- Итоговая строка — это среднее качество по всем тестовым месяцам, поэтому "
+        "она показывает не единичный удачный прогноз, а устойчивость во времени.",
+        "",
+        "## Главный вывод",
+        "",
+    ])
+    if overall_winner is not None:
+        lines.extend([
+            "По среднему совокупному MAPE двух потоков лучший общий результат показала "
+            "**{}** (`{}`).".format(
+                model_name_ru(overall_winner["model"]), overall_winner["model"]
+            ),
+            "",
+            "- Средний MAPE двух потоков: **{}%**.".format(
+                _number(overall_winner["mean_mape"])
+            ),
+            "- Худшая ошибка среди потоков и тестовых месяцев: **{}%**.".format(
+                _number(overall_winner["worst_mape"])
+            ),
+            "- Средний WAPE: **{}%**.".format(_number(overall_winner["mean_wape"])),
+            "",
+            "Общий победитель — удобный ориентир, но для бизнеса правильнее отдельно "
+            "смотреть зачисления и списания: у них могут победить разные модели.",
+            "",
+        ])
+
+    lines.extend(["## Лучшие модели отдельно по потокам", ""])
+    best_rows: List[List[str]] = []
+    for flow_id, flow_name in FLOW_NAMES_RU.items():
+        candidates = summary[summary["flow"].eq(flow_id)].sort_values(
+            "aggregate_mape_mean_percent"
+        )
+        if candidates.empty:
+            continue
+        best = candidates.iloc[0]
+        best_rows.append([
+            flow_name,
+            model_name_ru(best["model"]),
+            _number(best["aggregate_mape_mean_percent"]) + "%",
+            _number(best["aggregate_mape_std_percent"]) + "%",
+            _number(best["aggregate_mape_worst_percent"]) + "%",
+            _number(best["bias_mean_percent"], sign=True) + "%",
+        ])
+    lines.extend(_markdown_table(
+        ["Поток", "Лучшая модель", "Средний MAPE", "Разброс MAPE", "Худший месяц", "Смещение"],
+        best_rows,
+    ))
+
+    lines.extend(["", "## Полное сравнение моделей", ""])
+    comparison_rows: List[List[str]] = []
+    ordered = summary.sort_values(["flow", "aggregate_mape_mean_percent"])
+    for _, row in ordered.iterrows():
+        comparison_rows.append([
+            model_name_ru(row["model"]),
+            FLOW_NAMES_RU.get(str(row["flow"]), str(row["flow"])),
+            _number(row["aggregate_mape_mean_percent"]) + "%",
+            _number(row["aggregate_mape_std_percent"]) + "%",
+            _number(row["aggregate_mape_worst_percent"]) + "%",
+            _number(row["wape_mean_percent"]) + "%",
+            _number(row["company_mape_mean_percent"]) + "%",
+            _number(row["bias_mean_percent"], sign=True) + "%",
+        ])
+    lines.extend(_markdown_table(
+        [
+            "Модель", "Поток", "MAPE общий", "Разброс", "Худший", "WAPE",
+            "MAPE по ИНН", "Смещение",
+        ],
+        comparison_rows,
+    ))
+
+    lines.extend([
+        "",
+        "## Что означают показатели",
+        "",
+        "- **MAPE общий** — ошибка совокупной месячной суммы по всем ИНН: "
+        "`|сумма прогноза − сумма факта| / сумма факта`. Это основной показатель "
+        "для задачи совокупных зачислений и списаний. Чем меньше, тем лучше.",
+        "- **Разброс MAPE** — стандартное отклонение ошибки между тестовыми месяцами. "
+        "Малое значение означает, что качество меньше скачет от месяца к месяцу.",
+        "- **Худший месяц** — максимальный общий MAPE среди тестовых периодов. Он "
+        "показывает риск плохого месяца, который среднее значение может скрыть.",
+        "- **WAPE** — сумма абсолютных ошибок по отдельным ИНН, делённая на общую "
+        "фактическую сумму. Ошибки разных компаний здесь не компенсируют друг друга.",
+        "- **MAPE по ИНН** — средняя процентная ошибка компаний, у которых факт не "
+        "равен нулю. Показатель чувствителен к небольшим суммам.",
+        "- **Смещение** — систематическое завышение или занижение. Плюс означает, "
+        "что модель в среднем завышает поток; минус — занижает; около нуля лучше.",
+        "",
+        "### Почему общий MAPE может быть хорошим, а MAPE по ИНН плохим",
+        "",
+        "Модель может завысить прогноз одной компании и занизить другой. В общей "
+        "сумме эти ошибки взаимно компенсируются, поэтому общий MAPE будет низким. "
+        "WAPE и MAPE по ИНН покажут, что точность на уровне конкретного клиента хуже.",
+        "",
+        "## Как принять решение",
+        "",
+        "1. Для планирования общей ликвидности сначала сравните **MAPE общий**, "
+        "**худший месяц** и **смещение**.",
+        "2. Для поклиентских решений обязательно смотрите **WAPE** и **MAPE по ИНН**.",
+        "3. Сравнивайте ML-модели с `Прогнозом по среднему`: сложная модель имеет "
+        "смысл только если стабильно лучше простого baseline.",
+        "4. Универсальной границы «хорошей точности» нет. Допустимый процент ошибки "
+        "нужно связать с денежной суммой риска и бизнес-допуском компании.",
+        "",
+        "## Какие файлы смотреть",
+        "",
+        "- `отчет_стабильность_моделей.csv` — компактный рейтинг моделей.",
+        "- `отчет_метрики_по_периодам.csv` — детализация каждого тестового месяца.",
+        "- `отчет_прогнозы_по_инн.parquet` — факт и прогноз по каждому ИНН.",
+        "- `отчет_окна_тестирования.csv` — какие месяцы использовались для обучения и теста.",
+        "- `бизнес_вывод.txt` — самый короткий текстовый вывод.",
+        "- `краткий_отчет.md` — этот документ с расшифровкой результатов.",
+    ])
+    return "\n".join(lines) + "\n"
+
+
 def write_russian_reports(
     output: Path,
     metrics: pd.DataFrame,
@@ -174,4 +357,7 @@ def write_russian_reports(
     periods = int(windows["fold"].nunique()) if not windows.empty else 0
     (output / "бизнес_вывод.txt").write_text(
         _business_conclusion(summary, periods), encoding="utf-8"
+    )
+    (output / "краткий_отчет.md").write_text(
+        _markdown_summary(metrics, summary, windows), encoding="utf-8"
     )
