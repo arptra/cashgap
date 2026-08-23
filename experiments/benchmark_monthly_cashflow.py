@@ -146,7 +146,10 @@ def build_monthly_dataset(daily: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]
     # Keep zero-activity calendar months, but expand only at month granularity.
     # The old daily expansion could turn sparse transactions into billions of
     # rows before they were immediately aggregated back to months.
-    bounds = monthly.groupby("inn", as_index=False)["month"].agg(start_month="min", end_month="max")
+    bounds = monthly.groupby("inn", as_index=False).agg(
+        start_month=("month", "min"),
+        end_month=("month", "max"),
+    )
     all_months = pd.date_range(monthly["month"].min(), monthly["month"].max(), freq="MS")
     grid = pd.MultiIndex.from_product(
         [bounds["inn"].astype("string"), all_months], names=["inn", "month"]
