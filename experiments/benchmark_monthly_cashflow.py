@@ -49,21 +49,21 @@ def _check_dependencies() -> None:
     missing_required = [package for module, package in required.items() if importlib.util.find_spec(module) is None]
     missing_optional = [package for module, package in optional.items() if importlib.util.find_spec(module) is None]
     executable = shlex.quote(sys.executable)
-    print("Dependency check | Python {} | {}".format(sys.version.split()[0], sys.executable))
+    print("Проверка зависимостей | Python {} | {}".format(sys.version.split()[0], sys.executable))
     if missing_required:
-        print("ERROR: missing required libraries: {}".format(", ".join(missing_required)))
-        print("Install: {} -m pip install {}".format(executable, " ".join(missing_required)))
+        print("ОШИБКА: отсутствуют обязательные библиотеки: {}".format(", ".join(missing_required)))
+        print("Установка: {} -m pip install {}".format(executable, " ".join(missing_required)))
         print("Jupyter: %pip install {}".format(" ".join(missing_required)))
-        print("After installation restart the Jupyter kernel.")
+        print("После установки перезапустите kernel Jupyter.")
         raise SystemExit(2)
     if missing_optional:
-        print("WARNING: Torch MLP models are unavailable: {}".format(", ".join(missing_optional)))
-        print("CPU install: {} -m pip install {}".format(executable, " ".join(missing_optional)))
+        print("ВНИМАНИЕ: Torch MLP недоступны: {}".format(", ".join(missing_optional)))
+        print("Установка CPU: {} -m pip install {}".format(executable, " ".join(missing_optional)))
         print("CUDA 11.8: {} -m pip install torch==2.3.1 --index-url https://download.pytorch.org/whl/cu118".format(executable))
         print("CUDA 12.1: {} -m pip install torch==2.3.1 --index-url https://download.pytorch.org/whl/cu121".format(executable))
-        print("After installation restart the Jupyter kernel.")
+        print("После установки перезапустите kernel Jupyter.")
     else:
-        print("Dependency check: all benchmark libraries are available.")
+        print("Проверка зависимостей: все библиотеки benchmark установлены.")
 
 
 if __name__ == "__main__":
@@ -82,8 +82,10 @@ from threadpoolctl import threadpool_limits
 
 try:
     from experiments.train_cashflow_proxy import build_observed_daily
+    from experiments.monthly_reports_ru import russian_summary, write_russian_reports
 except ImportError:
     from train_cashflow_proxy import build_observed_daily
+    from monthly_reports_ru import russian_summary, write_russian_reports
 
 
 TARGET_COLUMNS = ["target_inflow", "target_outflow"]
@@ -151,6 +153,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mlp-params", default=None, help="best_params.json produced by autotune_cashflow.py")
     parser.add_argument("--boosting-params", default=None, help="best_params.json produced by autotune_cashflow.py")
     parser.add_argument("--mape-zero-floor", type=float, default=1.0)
+    parser.add_argument(
+        "--technical-reports-only", action="store_true", help=argparse.SUPPRESS
+    )
     return parser.parse_args()
 
 
@@ -191,7 +196,7 @@ def build_monthly_dataset(daily: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]
     activity_columns = ["active_inflow_days", "active_outflow_days", "negative_days"]
     monthly[amount_columns] = monthly[amount_columns].fillna(0.0)
     monthly[activity_columns] = monthly[activity_columns].fillna(0).astype(np.int16)
-    print("Monthly grid | observed rows: {:,} | with inactive months: {:,}".format(
+    print("Месячная сетка | наблюдаемых строк: {:,} | с неактивными месяцами: {:,}".format(
         observed_rows, len(monthly)
     ))
     monthly["target_net_flow"] = monthly["target_inflow"] - monthly["target_outflow"]
@@ -404,7 +409,7 @@ def predict_torch_mlp(
     modules.append(nn.Linear(width, 2))
     model = nn.Sequential(*modules).to(device)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
-    print("    {} | layers={} | rows={:,} | batch={:,} | parameters={:,}".format(
+    print("    {} | слои={} | строк={:,} | batch={:,} | параметров={:,}".format(
         device, list(layers), len(x_train), batch_size, parameter_count
     ))
     optimizer = torch.optim.AdamW(
@@ -445,7 +450,7 @@ def predict_torch_mlp(
     prediction_log = prediction_scaled * y_scale + y_mean
     if device.type == "cuda":
         allocated = torch.cuda.memory_allocated(device) / (1024 ** 3)
-        print("    {}: epoch={}, {:.2f}s, VRAM {:.2f} GiB".format(
+        print("    {}: эпоха={}, {:.2f} сек, VRAM {:.2f} GiB".format(
             device, epoch, time.perf_counter() - started, allocated
         ))
     return inverse_log_predictions(prediction_log)
@@ -474,7 +479,7 @@ def resolve_devices(mlp2: str, mlp3: str, parallel: bool) -> Tuple[str, str]:
         return "cpu"
 
     result = resolve(mlp2, 0), resolve(mlp3, 1)
-    print("PyTorch GPU count: {} | MLP-2: {} | MLP-3: {}".format(count, result[0], result[1]))
+    print("PyTorch видит GPU: {} | MLP-2: {} | MLP-3: {}".format(count, result[0], result[1]))
     for index in sorted({int(item.split(":", 1)[1]) for item in result if item.startswith("cuda:")}):
         properties = torch.cuda.get_device_properties(index)
         print("  cuda:{} | {} | {:.1f} GiB".format(
@@ -606,7 +611,7 @@ def main() -> None:
     args.boosting_tuned_params = load_tuned_params(args.boosting_params, "gradient_boosting")
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    print("\n=== MONTHLY CASH-FLOW BENCHMARK ===")
+    print("\n=== МЕСЯЧНЫЙ BENCHMARK ДЕНЕЖНЫХ ПОТОКОВ ===")
     observed_daily = build_observed_daily(args)
     monthly, features = build_monthly_dataset(observed_daily)
     del observed_daily
@@ -622,14 +627,14 @@ def main() -> None:
     jobs = args.cpu_threads or (max(1, total_cpus // 4) if args.parallel else total_cpus)
     cpu_heavy_models = sum(name in {"linear_regression", "gradient_boosting"} for name in models)
     estimated_cpu_threads = min(total_cpus, jobs * cpu_heavy_models)
-    print("INNs: {:,} | months: {} | features: {} | folds: {}".format(
+    print("ИНН: {:,} | месяцев: {} | признаков: {} | тестовых периодов: {}".format(
         monthly["inn"].nunique(), monthly["month"].nunique(), len(features), len(fold_specs)
     ))
-    print("Peak process RAM after features: {:.2f} GiB".format(peak_rss_gib()))
-    print("Resources | CPU threads/model: {} | concurrent CPU target: ~{}/{} ({:.0f}%)".format(
+    print("Пиковая RAM после подготовки признаков: {:.2f} GiB".format(peak_rss_gib()))
+    print("Ресурсы | CPU-потоков на модель: {} | одновременно: ~{}/{} ({:.0f}%)".format(
         jobs, estimated_cpu_threads, total_cpus, estimated_cpu_threads / total_cpus * 100
     ))
-    print("GPU architectures | {}: {} | {}: {}".format(
+    print("Архитектуры GPU-моделей | {}: {} | {}: {}".format(
         devices[0], list(args.mlp2_layers_parsed), devices[1], list(args.mlp3_layers_parsed)
     ))
 
@@ -643,10 +648,10 @@ def main() -> None:
         fold = materialize_fold(monthly, fold_spec, features)
         fold_number = int(fold["fold"])
         test_month = pd.Timestamp(fold["test_month"])
-        print("\n--- Fold {}/{} | test {} ---".format(
+        print("\n--- Тестовый период {}/{} | месяц {} ---".format(
             fold_number, len(fold_specs), test_month.strftime("%Y-%m")
         ))
-        print("Fold rows | train {:,} | valid {:,} | test {:,} | peak RAM {:.2f} GiB".format(
+        print("Строки | обучение {:,} | валидация {:,} | тест {:,} | пик RAM {:.2f} GiB".format(
             len(fold["train"]), len(fold["valid"]), len(fold["test"]), peak_rss_gib()
         ))
         window_rows.append({
@@ -698,7 +703,7 @@ def main() -> None:
                 "predicted_outflow": prediction[:, 1],
             }))
             primary = [row for row in metric_rows if row["fold"] == fold_number and row["model"] == name]
-            print("  {:24s} | credit MAPE {:6.2f}% | debit MAPE {:6.2f}% | {:.1f}s".format(
+            print("  {:24s} | MAPE зачислений {:6.2f}% | MAPE списаний {:6.2f}% | {:.1f} сек".format(
                 name, primary[0]["aggregate_mape_percent"], primary[1]["aggregate_mape_percent"], seconds
             ))
         fold_predictions = pd.concat(fold_prediction_rows, ignore_index=True)
@@ -708,10 +713,10 @@ def main() -> None:
                 predictions_in_progress, prediction_table.schema, compression="snappy"
             )
         prediction_writer.write_table(prediction_table)
-        print("Fold predictions streamed: {:,} rows".format(len(fold_predictions)))
+        print("Прогнозы периода потоково записаны: {:,} строк".format(len(fold_predictions)))
         del results, fold, actual, prediction, fold_prediction_rows, fold_predictions, prediction_table
         release_fold_memory(devices)
-        print("Memory after fold | current {:.2f} GiB | peak {:.2f} GiB".format(
+        print("Память после периода | текущая {:.2f} GiB | пиковая {:.2f} GiB".format(
             current_rss_gib(), peak_rss_gib()
         ))
 
@@ -734,12 +739,20 @@ def main() -> None:
     metrics.to_csv(output / "monthly_fold_metrics.csv", index=False)
     summary.to_csv(output / "monthly_stability_summary.csv", index=False)
     windows.to_csv(output / "monthly_fold_windows.csv", index=False)
+    if not args.technical_reports_only:
+        write_russian_reports(output, metrics, summary, windows, predictions_path)
     config = vars(args).copy()
     config["features"] = features
     (output / "run_config.json").write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
-    print("\n=== STABILITY OVER {} TEST MONTHS ===".format(len(fold_specs)))
-    print(summary.to_string(index=False))
-    print("\nSaved to {}".format(output.resolve()))
+    print("\n=== СТАБИЛЬНОСТЬ ЗА {} ТЕСТОВЫХ МЕСЯЦЕВ ===".format(len(fold_specs)))
+    if not args.technical_reports_only:
+        print((output / "бизнес_вывод.txt").read_text(encoding="utf-8"))
+    else:
+        print(russian_summary(summary).to_string(index=False))
+    if args.technical_reports_only:
+        print("\nТехнические файлы периода сохранены: {}".format(output.resolve()))
+    else:
+        print("\nРусские отчёты и технические файлы сохранены: {}".format(output.resolve()))
 
 
 if __name__ == "__main__":

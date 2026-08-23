@@ -61,6 +61,12 @@ for index in range(torch.cuda.device_count()):
 %pip install numpy pandas pyarrow scikit-learn threadpoolctl "xgboost==2.1.4" "optuna==3.6.2"
 ```
 
+Для API-сервера под Python 3.8:
+
+```python
+%pip install "fastapi==0.103.2" "uvicorn==0.23.2"
+```
+
 Torch с CUDA 12.1:
 
 ```python
@@ -137,7 +143,17 @@ print(pq.read_schema(INFLOW))
   --mlp3-device cuda:1
 ```
 
-Результаты сохраняются в `artifacts/monthly_benchmark_base`:
+Результаты сохраняются в `artifacts/monthly_benchmark_base`. Основные
+бизнес-отчёты полностью на русском:
+
+- `отчет_стабильность_моделей.csv` — рейтинг и стабильность моделей;
+- `отчет_метрики_по_периодам.csv` — метрики каждого тестового месяца;
+- `отчет_окна_тестирования.csv` — границы обучения, валидации и теста;
+- `отчет_прогнозы_по_инн.parquet` — факт и прогноз каждой компании;
+- `бизнес_вывод.txt` — короткий вывод с лучшей моделью для каждого потока.
+
+CSV записываются в UTF-8 с BOM и разделителем `;`, поэтому корректно открываются
+в русском Excel. Для обратной совместимости рядом остаются технические файлы:
 
 - `monthly_stability_summary.csv` — среднее качество и стабильность за 10 месяцев;
 - `monthly_fold_metrics.csv` — метрики каждого месяца;
@@ -199,7 +215,10 @@ pools и RAM. Затем runner потоково объединяет резул
   --mlp2-device cuda:0 \
   --mlp3-device cuda:1 \
   --mlp2-layers 512,256 \
-  --mlp3-layers 768,512,256
+  --mlp3-layers 768,512,256 \
+  --save-model torch_mlp_3_layers \
+  --forecast-months 12 \
+  --model-output-dir "./artifacts/monthly_benchmark_isolated/saved_model"
 ```
 
 Объединённые файлы имеют те же имена, что у обычного benchmark. Постоянный лог
@@ -207,6 +226,44 @@ pools и RAM. Затем runner потоково объединяет резул
 `artifacts/monthly_benchmark_isolated/isolated_folds/fold_XX_offset_XX/child.log`.
 Если нативная библиотека или ОС завершит конкретный child, основной notebook
 останется жив, а runner покажет exit code и путь к последнему логу.
+
+`--save-model` — отдельный параметр финального этапа. После честной проверки на
+всех тестовых периодах выбранная модель ещё один раз обучается для эксплуатации
+и записывается в файл:
+
+- для MLP: `saved_model/model.pt`;
+- для линейной регрессии и бустинга: `saved_model/model.joblib`;
+- метаданные и описание: `model_metadata.json`, `описание_модели.json`;
+- прогнозы, которые читает API: `forecasts_api.parquet`;
+- русский отчёт: `прогнозы_для_api.csv` и `прогнозы_для_api.parquet`.
+
+Значение `--save-model` должно присутствовать в `--models`. Выбирайте победителя
+по тестовым метрикам, а не обязательно самую глубокую сеть.
+
+Первый будущий месяц является прямым прогнозом. Месяцы со второго по двенадцатый
+рекурсивные: предыдущий прогноз используется как часть истории следующего
+месяца, поэтому неопределённость растёт с горизонтом.
+
+Если benchmark уже завершён и победитель выбран, повторять тестовые периоды не
+нужно. Сохраните модель отдельной командой:
+
+```python
+import subprocess
+import sys
+
+subprocess.run([
+    sys.executable, "-u", "experiments/export_monthly_model.py",
+    "--outflow", "/data/outflow.parquet",
+    "--inflow", "/data/inflow.parquet",
+    "--output-dir", "./artifacts/monthly_benchmark_isolated/saved_model",
+    "--model", "torch_mlp_3_layers",
+    "--device", "cuda:1",
+    "--epochs", "100",
+    "--batch-size", "4096",
+    "--mlp3-layers", "768,512,256",
+    "--forecast-months", "12",
+], check=True)
+```
 
 ## 7. Посмотреть результаты базового обучения
 
@@ -243,6 +300,16 @@ display(predictions.sample(min(20, len(predictions))))
 совокупных зачислений или списаний за месяц. Чем меньше, тем лучше.
 `aggregate_mape_std_percent` показывает стабильность, а
 `aggregate_mape_worst_percent` — ошибку в худшем тестовом месяце.
+
+Русский рейтинг в notebook:
+
+```python
+summary_ru = pd.read_csv(
+    "./artifacts/monthly_benchmark_isolated/отчет_стабильность_моделей.csv",
+    sep=";",
+)
+display(summary_ru)
+```
 
 ## 8. Автотюнинг MLP на двух GPU
 
@@ -402,6 +469,70 @@ display(final_summary.sort_values(["flow", "aggregate_mape_mean_percent"]))
   --mlp3-device cuda:1
 ```
 
+## 12. Запустить API прогноза по ИНН и периоду
+
+API читает пакет из `--model-output-dir`. GPU для работы сервера не нужна:
+прогнозы на указанный горизонт уже рассчитаны финальной моделью. Запускайте в
+отдельном терминале сервера:
+
+```bash
+python experiments/forecast_api_server.py \
+  --model-dir "./artifacts/monthly_benchmark_isolated/saved_model" \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --api-key "change-me"
+```
+
+Из Jupyter можно запустить сервер в фоне отдельным процессом:
+
+```python
+import subprocess
+import sys
+
+api_process = subprocess.Popen([
+    sys.executable,
+    "-u",
+    "experiments/forecast_api_server.py",
+    "--model-dir", "./artifacts/monthly_benchmark_isolated/saved_model",
+    "--host", "0.0.0.0",
+    "--port", "8000",
+    "--api-key", "change-me",
+])
+print("PID API:", api_process.pid)
+```
+
+Остановить сервер из того же kernel:
+
+```python
+api_process.terminate()
+api_process.wait(timeout=10)
+```
+
+Проверка:
+
+```bash
+curl -H "X-API-Key: change-me" \
+  "http://127.0.0.1:8000/forecast?inn=7701234567&period=2025-06"
+```
+
+Или POST-запрос:
+
+```bash
+curl -X POST "http://127.0.0.1:8000/forecast" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: change-me" \
+  -d '{"inn":"7701234567","period":"2025-06"}'
+```
+
+Интерактивная документация Swagger доступна по адресу
+`http://АДРЕС_СЕРВЕРА:8000/docs`. Если сервер доступен только локально, можно
+убрать `--api-key` и использовать `--host 127.0.0.1`. Не открывайте
+`0.0.0.0:8000` во внешнюю сеть без API-ключа и сетевого ограничения доступа.
+
+Успешный ответ содержит прогноз зачислений, списаний, чистого потока, признак
+отрицательного потока и тип прогноза — прямой или рекурсивный. Если ИНН или месяц
+не входят в сохранённый пакет, сервер вернёт HTTP 404 с русским объяснением.
+
 ## Что запускать по порядку
 
 1. Разделы 1–4 — обновление и проверка среды.
@@ -411,8 +542,9 @@ display(final_summary.sort_values(["flow", "aggregate_mape_mean_percent"]))
 5. Раздел 9 — автотюнинг gradient boosting.
 6. Раздел 10 — финальная честная проверка лучших настроек.
 7. Раздел 11 — отдельный дневной бизнес-demo, если он нужен.
+8. Раздел 12 — API после появления каталога `saved_model`.
 
-Месячный benchmark и дневной скрипт сохраняют реальные out-of-sample прогнозы и
-метрики. Сейчас они не сохраняют единый production-checkpoint для прогноза новых
-будущих данных: его следует обучать и сохранять отдельным финальным этапом после
-выбора победившей архитектуры.
+Месячный benchmark сохраняет реальные out-of-sample прогнозы и метрики, а
+`--save-model` после проверки обучает отдельный production-checkpoint. Не
+подменяйте честную оценку финальным обучением: сначала сравните модели на
+тестовых месяцах, затем сохраняйте победителя.

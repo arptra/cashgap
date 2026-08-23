@@ -23,13 +23,13 @@ def _check_dependencies() -> None:
     required = {"pandas": "pandas", "pyarrow": "pyarrow"}
     missing = [package for module, package in required.items() if importlib.util.find_spec(module) is None]
     if not missing:
-        print("Dependency check: isolated runner libraries are available.")
+        print("Проверка зависимостей: библиотеки изолированного runner установлены.")
         return
     executable = shlex.quote(sys.executable)
-    print("ERROR: missing isolated runner libraries: {}".format(", ".join(missing)))
-    print("Install: {} -m pip install {}".format(executable, " ".join(missing)))
+    print("ОШИБКА: отсутствуют библиотеки runner: {}".format(", ".join(missing)))
+    print("Установка: {} -m pip install {}".format(executable, " ".join(missing)))
     print("Jupyter: %pip install {}".format(" ".join(missing)))
-    print("After installation restart the Jupyter kernel.")
+    print("После установки перезапустите kernel Jupyter.")
     raise SystemExit(2)
 
 
@@ -39,6 +39,11 @@ if __name__ == "__main__":
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+try:
+    from experiments.monthly_reports_ru import write_russian_reports
+except ImportError:
+    from monthly_reports_ru import write_russian_reports
 
 
 DEFAULT_MODELS = ",".join([
@@ -72,6 +77,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mlp-params", default=None)
     parser.add_argument("--boosting-params", default=None)
     parser.add_argument("--mape-zero-floor", type=float, default=1.0)
+    parser.add_argument(
+        "--save-model", default=None,
+        help="После benchmark обучить на всех данных и сохранить одну выбранную модель",
+    )
+    parser.add_argument(
+        "--model-output-dir", default=None,
+        help="Каталог модели; по умолчанию OUTPUT_DIR/saved_model",
+    )
+    parser.add_argument("--forecast-months", type=int, default=12)
+    parser.add_argument(
+        "--save-model-device", default=None,
+        help="Устройство финального обучения; по умолчанию GPU выбранной MLP",
+    )
     return parser.parse_args()
 
 
@@ -98,6 +116,7 @@ def child_command(args: argparse.Namespace, fold_output: Path, offset: int) -> L
         "--cpu-threads", str(args.cpu_threads),
         "--boosting-iterations", str(args.boosting_iterations),
         "--mape-zero-floor", str(args.mape_zero_floor),
+        "--technical-reports-only",
     ]
     if args.parallel:
         command.append("--parallel")
@@ -113,7 +132,9 @@ def child_command(args: argparse.Namespace, fold_output: Path, offset: int) -> L
 
 
 def run_child(command: List[str], log_path: Path) -> None:
-    print("Child command: {}".format(" ".join(shlex.quote(part) for part in command)), flush=True)
+    print("Команда дочернего процесса: {}".format(
+        " ".join(shlex.quote(part) for part in command)
+    ), flush=True)
     with log_path.open("w", encoding="utf-8", buffering=1) as log_file:
         process = subprocess.Popen(
             command,
@@ -129,10 +150,45 @@ def run_child(command: List[str], log_path: Path) -> None:
         return_code = process.wait()
     if return_code != 0:
         raise RuntimeError(
-            "Isolated fold process failed with exit code {}. Persistent log: {}".format(
+            "Дочерний процесс периода завершился с кодом {}. Постоянный лог: {}".format(
                 return_code, log_path.resolve()
             )
         )
+
+
+def export_command(args: argparse.Namespace, model_output: Path) -> List[str]:
+    exporter = Path(__file__).with_name("export_monthly_model.py").resolve()
+    if args.save_model == "torch_mlp_3_layers":
+        default_device = args.mlp3_device
+    else:
+        default_device = args.mlp2_device
+    command = [
+        sys.executable,
+        "-u",
+        str(exporter),
+        "--outflow", args.outflow,
+        "--inflow", args.inflow,
+        "--output-dir", str(model_output),
+        "--model", args.save_model,
+        "--forecast-months", str(args.forecast_months),
+        "--seed", str(args.seed),
+        "--epochs", str(args.epochs),
+        "--batch-size", str(args.batch_size),
+        "--device", args.save_model_device or default_device,
+        "--mlp2-layers", args.mlp2_layers,
+        "--mlp3-layers", args.mlp3_layers,
+        "--cpu-threads", str(args.cpu_threads),
+        "--boosting-iterations", str(args.boosting_iterations),
+    ]
+    optional = {
+        "--max-inns": args.max_inns,
+        "--mlp-params": args.mlp_params,
+        "--boosting-params": args.boosting_params,
+    }
+    for option, value in optional.items():
+        if value is not None:
+            command.extend([option, str(value)])
+    return command
 
 
 def append_prediction_batches(
@@ -169,7 +225,16 @@ def stability_summary(metrics: pd.DataFrame) -> pd.DataFrame:
 def main() -> None:
     args = parse_args()
     if args.test_periods < 1:
-        raise ValueError("--test-periods must be positive.")
+        raise ValueError("--test-periods должен быть положительным.")
+    if args.save_model and args.forecast_months < 1:
+        raise ValueError("--forecast-months должен быть положительным.")
+    selected_models = [item.strip() for item in args.models.split(",") if item.strip()]
+    if args.save_model and args.save_model not in selected_models:
+        raise ValueError(
+            "--save-model={} отсутствует в --models. Сначала честно протестируйте сохраняемую модель.".format(
+                args.save_model
+            )
+        )
     output = Path(args.output_dir)
     children = output / "isolated_folds"
     children.mkdir(parents=True, exist_ok=True)
@@ -188,7 +253,7 @@ def main() -> None:
             fold_output = children / "fold_{:02d}_offset_{:02d}".format(fold_number, offset)
             fold_output.mkdir(parents=True, exist_ok=True)
             log_path = fold_output / "child.log"
-            print("\n=== ISOLATED FOLD {}/{} | offset {} ===".format(
+            print("\n=== ИЗОЛИРОВАННЫЙ ПЕРИОД {}/{} | смещение {} ===".format(
                 fold_number, args.test_periods, offset
             ), flush=True)
             run_child(child_command(args, fold_output, offset), log_path)
@@ -202,7 +267,7 @@ def main() -> None:
             writer = append_prediction_batches(
                 fold_output / "monthly_predictions.parquet", fold_number, writer, in_progress
             )
-            print("Isolated fold {} artifacts merged; child process memory is fully released.".format(
+            print("Артефакты периода {} объединены; память дочернего процесса полностью освобождена.".format(
                 fold_number
             ), flush=True)
         completed = True
@@ -211,7 +276,7 @@ def main() -> None:
             writer.close()
 
     if not completed:
-        raise RuntimeError("Isolated benchmark did not complete all folds.")
+        raise RuntimeError("Изолированный benchmark не завершил все тестовые периоды.")
     os.replace(str(in_progress), str(final_predictions))
     metrics = pd.concat(metric_frames, ignore_index=True)
     windows = pd.concat(window_frames, ignore_index=True)
@@ -219,14 +284,27 @@ def main() -> None:
     metrics.to_csv(output / "monthly_fold_metrics.csv", index=False)
     windows.to_csv(output / "monthly_fold_windows.csv", index=False)
     summary.to_csv(output / "monthly_stability_summary.csv", index=False)
+    write_russian_reports(output, metrics, summary, windows, final_predictions)
     config: Dict[str, object] = vars(args).copy()
     config["execution"] = "one isolated child process per test month"
     (output / "run_config.json").write_text(
         json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    print("\n=== ISOLATED STABILITY OVER {} TEST MONTHS ===".format(args.test_periods))
-    print(summary.to_string(index=False))
-    print("\nSaved to {}".format(output.resolve()))
+    print("\n=== СТАБИЛЬНОСТЬ ЗА {} ИЗОЛИРОВАННЫХ ТЕСТОВЫХ МЕСЯЦЕВ ===".format(
+        args.test_periods
+    ))
+    print((output / "бизнес_вывод.txt").read_text(encoding="utf-8"))
+    print("\nРусские отчёты и технические файлы сохранены: {}".format(output.resolve()))
+    if args.save_model:
+        model_output = Path(args.model_output_dir) if args.model_output_dir else output / "saved_model"
+        model_output.mkdir(parents=True, exist_ok=True)
+        print("\n=== ФИНАЛЬНОЕ ОБУЧЕНИЕ И СОХРАНЕНИЕ МОДЕЛИ {} ===".format(
+            args.save_model
+        ))
+        run_child(export_command(args, model_output), output / "model_export.log")
+        print("Модель и таблица прогнозов для API сохранены: {}".format(
+            model_output.resolve()
+        ))
 
 
 if __name__ == "__main__":
