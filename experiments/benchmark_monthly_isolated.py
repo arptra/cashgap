@@ -19,6 +19,15 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 
+if __name__ == "__main__" and os.environ.get("CASHGAP_EXTERNAL_DRIVER") != "1":
+    try:
+        from experiments.launch_training import detach_current_script
+    except ImportError:
+        from launch_training import detach_current_script
+    if detach_current_script("monthly_isolated", sys.argv[1:], Path(__file__)):
+        raise SystemExit(0)
+
+
 def _check_dependencies() -> None:
     required = {"pandas": "pandas", "pyarrow": "pyarrow"}
     missing = [package for module, package in required.items() if importlib.util.find_spec(module) is None]

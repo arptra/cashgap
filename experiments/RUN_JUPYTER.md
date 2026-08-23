@@ -12,6 +12,11 @@ Parquet-файла:
 Все команды ниже выполняются в отдельных ячейках Jupyter. Замените пути
 `/data/outflow.parquet` и `/data/inflow.parquet` на реальные.
 
+Важно: benchmark и автотюнинг теперь всегда выносятся из Jupyter kernel
+до импорта pandas, PyArrow, Optuna и Torch. Ячейка сразу возвращает PID и
+путь к логу, а обучение продолжается в отдельном supervisor. Это не ошибка
+и не означает, что обучение завершилось.
+
 ## 1. Получить последнюю версию проекта
 
 Если репозиторий уже склонирован:
@@ -273,7 +278,7 @@ subprocess.run([
 `benchmark_monthly_isolated.py`. Запускайте специальный Torch-only pipeline:
 
 ```python
-%run experiments/benchmark_torch_sequential.py \
+%run experiments/launch_training.py benchmark \
   --outflow "/data/outflow.parquet" \
   --inflow "/data/inflow.parquet" \
   --output-dir "./artifacts/torch_10_sequential" \
@@ -287,6 +292,21 @@ subprocess.run([
   --cpu-threads 8 \
   --amp
 ```
+
+Ячейка завершится сразу, но обучение будет работать. Проверка статуса и
+последних 60 строк лога:
+
+```python
+%run experiments/launch_training.py status \
+  --output-dir "./artifacts/torch_10_sequential" \
+  --lines 60
+```
+
+Статус покажет `RUNNING`, `COMPLETED`, `FAILED` или `SUPERVISOR_DIED`, PID,
+память всего дерева driver+workers, системную память, реальный cgroup-лимит
+и OOM-счётчики, GPU и путь к полному `driver.log`. При нативном
+падении в `status.json` останется точный сигнал, например `SIGSEGV` или
+`SIGKILL`, даже если Python не успел вывести traceback.
 
 Здесь нет флага `--parallel`. Периоды идут строго по одному: первый на
 `cuda:0`, второй на `cuda:1`, третий снова на `cuda:0` и так далее. Активная GPU
@@ -375,7 +395,7 @@ PyTorch-процессе. Одновременно работает ровно �
 Финальные 10 месяцев защищены от автотюнинга. Запуск:
 
 ```python
-%run experiments/autotune_torch_stable.py \
+%run experiments/launch_training.py autotune \
   --outflow "/data/outflow.parquet" \
   --inflow "/data/inflow.parquet" \
   --output-dir "./artifacts/cashflow_tuning_stable" \
@@ -404,13 +424,21 @@ artifacts/cashflow_tuning_stable/best_params.json
 `trials/trial_XXXXX/fold_XX_YYYYMM/worker.log`; при падении рядом будет
 `failure_diagnostics.txt`.
 
+Смотреть ход автотюнинга:
+
+```python
+%run experiments/launch_training.py status \
+  --output-dir "./artifacts/cashflow_tuning_stable" \
+  --lines 60
+```
+
 Повторный запуск той же команды не перечитывает Parquet, продолжает study и
 добавляет ещё указанное в `--trials` количество trials.
 
 Для более долгого поиска достаточно увеличить число trials и epochs:
 
 ```python
-%run experiments/autotune_torch_stable.py \
+%run experiments/launch_training.py autotune \
   --outflow "/data/outflow.parquet" \
   --inflow "/data/inflow.parquet" \
   --output-dir "./artifacts/cashflow_tuning_stable_full" \

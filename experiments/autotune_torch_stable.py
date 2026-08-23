@@ -22,6 +22,15 @@ from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
 
+if __name__ == "__main__" and os.environ.get("CASHGAP_EXTERNAL_DRIVER") != "1":
+    try:
+        from experiments.launch_training import detach_current_script
+    except ImportError:
+        from launch_training import detach_current_script
+    if detach_current_script("autotune", sys.argv[1:]):
+        raise SystemExit(0)
+
+
 def _check_dependencies() -> None:
     required = {
         "numpy": "numpy",
