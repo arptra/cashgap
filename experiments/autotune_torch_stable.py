@@ -290,6 +290,11 @@ def completed_trials(study: optuna.Study) -> List[optuna.trial.FrozenTrial]:
     return [trial for trial in study.trials if trial.state == TrialState.COMPLETE]
 
 
+def display_month(value: object) -> str:
+    text_value = str(value)
+    return "{}-{}".format(text_value[:4], text_value[4:6]) if len(text_value) == 6 else text_value
+
+
 def write_reports(
     study: optuna.Study,
     output: Path,
@@ -300,40 +305,41 @@ def write_reports(
     trials_frame = study.trials_dataframe()
     trials_frame.to_csv(output / "trials.csv", index=False)
     russian = trials_frame.rename(columns={
-        "number": "номер_trial",
-        "value": "целевая_ошибка",
-        "datetime_start": "время_начала",
-        "datetime_complete": "время_завершения",
-        "duration": "длительность",
-        "state": "состояние",
-        "params_n_layers": "число_слоев",
-        "params_first_width": "ширина_первого_слоя",
-        "params_width_shrink": "коэффициент_сужения",
-        "params_batch_size": "размер_пакета",
-        "params_learning_rate": "скорость_обучения",
-        "params_weight_decay": "штраф_весов",
-        "params_dropout": "доля_отключения",
-        "params_activation": "активация",
-        "params_patience": "терпение_ранней_остановки",
-        "user_attrs_layers": "слои",
+        "number": "Номер варианта",
+        "value": "Целевая ошибка",
+        "datetime_start": "Время начала",
+        "datetime_complete": "Время завершения",
+        "duration": "Длительность",
+        "state": "Состояние",
+        "params_n_layers": "Количество слоёв",
+        "params_first_width": "Ширина первого слоя",
+        "params_width_shrink": "Коэффициент сужения слоёв",
+        "params_batch_size": "Размер пакета",
+        "params_learning_rate": "Скорость обучения",
+        "params_weight_decay": "Регуляризация весов",
+        "params_dropout": "Доля отключения нейронов",
+        "params_activation": "Функция активации",
+        "params_patience": "Ожидание ранней остановки",
+        "user_attrs_layers": "Структура слоёв",
     })
-    if "состояние" in russian.columns:
-        russian["состояние"] = russian["состояние"].replace({
+    if "Состояние" in russian.columns:
+        russian["Состояние"] = russian["Состояние"].replace({
             "COMPLETE": "ЗАВЕРШЕН",
             "FAIL": "ОШИБКА",
             "RUNNING": "ВЫПОЛНЯЕТСЯ",
             "PRUNED": "ОСТАНОВЛЕН_ДОСРОЧНО",
         })
-    if "целевая_ошибка" in russian.columns:
-        russian["целевая_ошибка_процент"] = russian["целевая_ошибка"] * 100.0
+    if "Целевая ошибка" in russian.columns:
+        russian["Целевая ошибка, %"] = russian.pop("Целевая ошибка") * 100.0
     russian.to_csv(
-        output / "отчет_автотюнинг.csv", index=False, sep=";", encoding="utf-8-sig"
+        output / "отчет_автотюнинг.csv", index=False, sep=";", decimal=",",
+        encoding="utf-8-sig", float_format="%.4f",
     )
     complete = completed_trials(study)
     failed = [trial for trial in study.trials if trial.state == TrialState.FAIL]
     running = [trial for trial in study.trials if trial.state == TrialState.RUNNING]
     lines = [
-        "# Краткий отчёт автотюнинга MLP",
+        "# Отчёт по автоматическому подбору MLP",
         "",
         "## Состояние",
         "",
@@ -342,14 +348,18 @@ def write_reports(
         "- Незавершённых trials из предыдущих запусков: **{}**.".format(len(running)),
         "- GPU workers: **{}**.".format(", ".join(devices)),
         "- Месяцы подбора: **{}**.".format(
-            ", ".join(str(fold["test_month"]) for fold in folds)
+            ", ".join(display_month(fold["test_month"]) for fold in folds)
         ),
         "- Защищённые финальные месяцы: **{}**.".format(
-            ", ".join(str(value) for value in protected)
+            ", ".join(display_month(value) for value in protected)
         ),
         "",
         "Каждый trial оценивается по среднему совокупному MAPE зачислений и списаний "
         "на нескольких временных folds. Чем меньше objective, тем лучше.",
+        "",
+        "> Этот результат выбирает настройки модели, но ещё не является финальной "
+        "оценкой для бизнеса. Качество выбранных настроек нужно отдельно проверить "
+        "на защищённых {} месяцах, которые автотюнинг не видел.".format(len(protected)),
         "",
     ]
     if complete:
@@ -374,13 +384,15 @@ def write_reports(
         lines.extend([
             "## Лучший результат",
             "",
-            "- Trial: **{}**.".format(best.number),
-            "- Objective: **{:.3f}%**.".format(best.value * 100),
+            "- Номер варианта: **{}**.".format(best.number),
+            "- Средняя целевая ошибка: **{}%**.".format(
+                "{:.3f}".format(best.value * 100).replace(".", ",")
+            ),
             "- Слои: **{}**.".format(best_params.get("layers")),
-            "- Batch size: **{}**.".format(best_params.get("batch_size")),
-            "- Learning rate: **{}**.".format(best_params.get("learning_rate")),
-            "- Dropout: **{}**.".format(best_params.get("dropout")),
-            "- Activation: **{}**.".format(best_params.get("activation")),
+            "- Размер пакета: **{}**.".format(best_params.get("batch_size")),
+            "- Скорость обучения: **{}**.".format(best_params.get("learning_rate")),
+            "- Доля отключения нейронов: **{}**.".format(best_params.get("dropout")),
+            "- Функция активации: **{}**.".format(best_params.get("activation")),
             "",
             "Файл `best_params.json` можно передать финальному benchmark через "
             "`--mlp-params`.",
@@ -401,9 +413,9 @@ def write_reports(
         "комбинация слоёв или batch приводит к OOM/SIGSEGV, Optuna получает состояние "
         "FAIL, сохраняет диагностику и переходит к следующей комбинации.",
     ])
-    (output / "краткий_отчет_автотюнинг.md").write_text(
-        "\n".join(lines) + "\n", encoding="utf-8"
-    )
+    report = "\n".join(lines) + "\n"
+    (output / "отчет_автотюнинг.md").write_text(report, encoding="utf-8")
+    (output / "краткий_отчет_автотюнинг.md").write_text(report, encoding="utf-8")
 
 
 def main() -> None:
@@ -512,7 +524,7 @@ def main() -> None:
         print("Параметры: {}".format((output / "best_params.json").resolve()))
     else:
         print("\nAutotune завершил запуск без успешных trials. Откройте краткий отчёт и diagnostics.")
-    print("Отчёт: {}".format((output / "краткий_отчет_автотюнинг.md").resolve()))
+    print("Отчёт: {}".format((output / "отчет_автотюнинг.md").resolve()))
 
 
 if __name__ == "__main__":

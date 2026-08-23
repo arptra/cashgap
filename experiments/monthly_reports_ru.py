@@ -30,74 +30,146 @@ def model_name_ru(model_id: str) -> str:
     return MODEL_NAMES_RU.get(str(model_id), str(model_id))
 
 
+def _month_values(values: pd.Series) -> pd.Series:
+    """Format Timestamp and compact YYYYMM values without turning them into 1970 dates."""
+    text = values.astype("string").str.strip()
+    compact = text.str.extract(r"(^|\D)(\d{6})(?:\.0)?($|\D)", expand=True)[1]
+    parsed_compact = pd.to_datetime(compact, format="%Y%m", errors="coerce")
+    parsed_regular = pd.to_datetime(values, errors="coerce")
+    parsed = parsed_compact.fillna(parsed_regular)
+    formatted = parsed.dt.strftime("%Y-%m")
+    return formatted.fillna(text)
+
+
 def _format_month_columns(frame: pd.DataFrame) -> pd.DataFrame:
     result = frame.copy()
     for column in ("test_month", "train_start", "train_end", "validation_month"):
         if column in result.columns:
-            result[column] = pd.to_datetime(result[column]).dt.strftime("%Y-%m")
+            result[column] = _month_values(result[column])
     return result
 
 
 def _write_csv(frame: pd.DataFrame, path: Path) -> None:
-    # UTF-8 BOM and semicolon make the report open correctly in Russian Excel.
-    frame.to_csv(path, index=False, sep=";", encoding="utf-8-sig", float_format="%.4f")
+    # BOM + semicolon + decimal comma are understood by Russian Excel without import wizard.
+    frame.to_csv(
+        path, index=False, sep=";", decimal=",", encoding="utf-8-sig", float_format="%.2f"
+    )
+
+
+def _stability_label(mean_value: object, std_value: object) -> str:
+    try:
+        mean = abs(float(mean_value))
+        deviation = abs(float(std_value))
+    except (TypeError, ValueError):
+        return "Недостаточно данных"
+    if pd.isna(mean) or pd.isna(deviation):
+        return "Недостаточно данных"
+    ratio = deviation / max(mean, 1e-9)
+    if ratio <= 0.25:
+        return "Стабильная"
+    if ratio <= 0.50:
+        return "Умеренно стабильная"
+    return "Нестабильная"
 
 
 def russian_metrics(metrics: pd.DataFrame) -> pd.DataFrame:
     result = _format_month_columns(metrics)
-    result.insert(3, "название_модели", result["model"].map(model_name_ru))
-    result["flow"] = result["flow"].map(FLOW_NAMES_RU).fillna(result["flow"])
-    columns = {
-        "fold": "номер_тестового_периода",
-        "test_month": "тестовый_месяц",
-        "model": "код_модели",
-        "flow": "денежный_поток",
-        "training_seconds": "время_обучения_сек",
-        "aggregate_mape": "MAPE_совокупный",
-        "aggregate_mape_percent": "MAPE_совокупный_процент",
-        "company_mape_nonzero": "MAPE_по_компаниям",
-        "company_mape_nonzero_percent": "MAPE_по_компаниям_процент",
-        "wape": "WAPE",
-        "wape_percent": "WAPE_процент",
-        "mae": "MAE_рублей",
-        "bias_percent": "смещение_прогноза_процент",
-        "actual_total": "фактическая_сумма",
-        "predicted_total": "прогнозная_сумма",
-        "nonzero_companies": "компаний_с_ненулевым_фактом",
-        "companies": "компаний_всего",
-    }
-    return result.rename(columns=columns)
+    business = pd.DataFrame({
+        "Номер тестового периода": result["fold"],
+        "Тестовый месяц": result["test_month"],
+        "Денежный поток": result["flow"].map(FLOW_NAMES_RU).fillna(result["flow"]),
+        "Модель": result["model"].map(model_name_ru),
+        "Фактическая сумма, руб.": result["actual_total"],
+        "Прогнозная сумма, руб.": result["predicted_total"],
+        "Отклонение прогноза, руб.": result["predicted_total"] - result["actual_total"],
+        "Абсолютная ошибка, руб.": (result["predicted_total"] - result["actual_total"]).abs(),
+        "Ошибка общей суммы MAPE, %": result["aggregate_mape_percent"],
+        "Ошибка по компаниям WAPE, %": result["wape_percent"],
+        "Средняя ошибка по ИНН, %": result["company_mape_nonzero_percent"],
+        "Смещение прогноза, %": result["bias_percent"],
+        "Компаний в тесте": result["companies"],
+        "Компаний с ненулевым фактом": result["nonzero_companies"],
+    })
+    if "training_seconds" in result.columns:
+        business["Время обучения, сек."] = result["training_seconds"]
+    return business.sort_values(
+        ["Тестовый месяц", "Денежный поток", "Ошибка общей суммы MAPE, %", "Модель"]
+    ).reset_index(drop=True)
 
 
 def russian_summary(summary: pd.DataFrame) -> pd.DataFrame:
-    result = summary.copy()
-    result.insert(1, "название_модели", result["model"].map(model_name_ru))
-    result["flow"] = result["flow"].map(FLOW_NAMES_RU).fillna(result["flow"])
-    return result.rename(columns={
-        "model": "код_модели",
-        "flow": "денежный_поток",
-        "aggregate_mape_mean_percent": "MAPE_средний_процент",
-        "aggregate_mape_std_percent": "MAPE_стандартное_отклонение_процент",
-        "aggregate_mape_worst_percent": "MAPE_худший_месяц_процент",
-        "wape_mean_percent": "WAPE_средний_процент",
-        "company_mape_mean_percent": "MAPE_по_компаниям_средний_процент",
-        "bias_mean_percent": "среднее_смещение_процент",
-        "folds": "количество_тестовых_периодов",
+    result = summary.sort_values(["flow", "aggregate_mape_mean_percent"]).copy()
+    result["rank"] = result.groupby("flow").cumcount() + 1
+    business = pd.DataFrame({
+        "Место": result["rank"],
+        "Денежный поток": result["flow"].map(FLOW_NAMES_RU).fillna(result["flow"]),
+        "Модель": result["model"].map(model_name_ru),
+        "Средняя ошибка общей суммы MAPE, %": result["aggregate_mape_mean_percent"],
+        "Разброс ошибки между месяцами, п.п.": result["aggregate_mape_std_percent"],
+        "Ошибка в худшем месяце, %": result["aggregate_mape_worst_percent"],
+        "Средняя ошибка по компаниям WAPE, %": result["wape_mean_percent"],
+        "Средняя ошибка по ИНН, %": result["company_mape_mean_percent"],
+        "Среднее смещение прогноза, %": result["bias_mean_percent"],
+        "Количество тестовых месяцев": result["folds"],
     })
+    business["Оценка стабильности"] = [
+        _stability_label(mean, deviation)
+        for mean, deviation in zip(
+            result["aggregate_mape_mean_percent"], result["aggregate_mape_std_percent"]
+        )
+    ]
+    business["Результат"] = business["Место"].map(
+        lambda value: "Лучшая модель" if int(value) == 1 else "Альтернатива"
+    )
+    return business.reset_index(drop=True)
 
 
 def russian_windows(windows: pd.DataFrame) -> pd.DataFrame:
     result = _format_month_columns(windows)
     return result.rename(columns={
-        "fold": "номер_тестового_периода",
-        "train_start": "обучение_с",
-        "train_end": "обучение_по",
-        "validation_month": "месяц_валидации",
-        "test_month": "тестовый_месяц",
-        "train_rows": "строк_обучения",
-        "validation_rows": "строк_валидации",
-        "test_rows": "строк_теста",
+        "fold": "Номер тестового периода",
+        "train_start": "Начало истории обучения",
+        "train_end": "Конец истории обучения",
+        "validation_month": "Месяц валидации",
+        "test_month": "Тестовый месяц",
+        "train_rows": "Строк в обучении",
+        "validation_rows": "Строк в валидации",
+        "test_rows": "Строк в тесте",
     })
+
+
+def russian_net_flow(metrics: pd.DataFrame) -> pd.DataFrame:
+    result = _format_month_columns(metrics)
+    keys = ["fold", "test_month", "model"]
+    actual = result.pivot_table(
+        index=keys, columns="flow", values="actual_total", aggfunc="first"
+    )
+    predicted = result.pivot_table(
+        index=keys, columns="flow", values="predicted_total", aggfunc="first"
+    )
+    required = set(FLOW_NAMES_RU)
+    if not required.issubset(actual.columns) or not required.issubset(predicted.columns):
+        return pd.DataFrame()
+    actual_net = actual["inflow_credit"] - actual["outflow_debit"]
+    predicted_net = predicted["inflow_credit"] - predicted["outflow_debit"]
+    business = pd.DataFrame({
+        "Номер тестового периода": actual.index.get_level_values("fold"),
+        "Тестовый месяц": actual.index.get_level_values("test_month"),
+        "Модель": actual.index.get_level_values("model").map(model_name_ru),
+        "Фактический чистый поток, руб.": actual_net.to_numpy(),
+        "Прогнозный чистый поток, руб.": predicted_net.to_numpy(),
+        "Отклонение прогноза, руб.": (predicted_net - actual_net).to_numpy(),
+        "Фактический поток отрицательный": actual_net.lt(0).map(
+            {True: "Да", False: "Нет"}
+        ).to_numpy(),
+        "Прогноз отрицательного потока": predicted_net.lt(0).map(
+            {True: "Да", False: "Нет"}
+        ).to_numpy(),
+        "Знак потока определён верно": actual_net.lt(0).eq(predicted_net.lt(0)).map(
+            {True: "Да", False: "Нет"}
+        ).to_numpy(),
+    })
+    return business.sort_values(["Тестовый месяц", "Модель"]).reset_index(drop=True)
 
 
 def _write_russian_predictions(source: Path, destination: Path) -> None:
@@ -106,18 +178,27 @@ def _write_russian_predictions(source: Path, destination: Path) -> None:
     try:
         for batch in parquet.iter_batches(batch_size=100_000):
             frame = batch.to_pandas()
-            frame["model_name_ru"] = frame["model"].map(model_name_ru)
-            frame = frame.rename(columns={
-                "fold": "номер_тестового_периода",
-                "test_month": "тестовый_месяц",
-                "inn": "инн",
-                "model": "код_модели",
-                "model_name_ru": "название_модели",
-                "actual_inflow": "фактические_зачисления",
-                "predicted_inflow": "прогноз_зачислений",
-                "actual_outflow": "фактические_списания",
-                "predicted_outflow": "прогноз_списаний",
+            business = pd.DataFrame({
+                "Номер тестового периода": frame["fold"],
+                "Тестовый месяц": _month_values(frame["test_month"]),
+                "ИНН": frame["inn"].astype("string"),
+                "Модель": frame["model"].map(model_name_ru),
+                "Фактические зачисления, руб.": frame["actual_inflow"],
+                "Прогноз зачислений, руб.": frame["predicted_inflow"],
+                "Ошибка зачислений, руб.": frame["predicted_inflow"] - frame["actual_inflow"],
+                "Фактические списания, руб.": frame["actual_outflow"],
+                "Прогноз списаний, руб.": frame["predicted_outflow"],
+                "Ошибка списаний, руб.": frame["predicted_outflow"] - frame["actual_outflow"],
             })
+            business["Фактический чистый поток, руб."] = (
+                business["Фактические зачисления, руб."]
+                - business["Фактические списания, руб."]
+            )
+            business["Прогнозный чистый поток, руб."] = (
+                business["Прогноз зачислений, руб."]
+                - business["Прогноз списаний, руб."]
+            )
+            frame = business
             table = pa.Table.from_pandas(frame, preserve_index=False)
             if writer is None:
                 writer = pq.ParquetWriter(destination, table.schema, compression="snappy")
@@ -341,6 +422,241 @@ def _markdown_summary(
     return "\n".join(lines) + "\n"
 
 
+def _number_ru(value: object, digits: int = 2, sign: bool = False) -> str:
+    value_text = _number(value, digits=digits, sign=sign)
+    return value_text.replace(".", ",")
+
+
+def _money_ru(value: object) -> str:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return "н/д"
+    if pd.isna(numeric):
+        return "н/д"
+    return "{:,.0f} ₽".format(numeric).replace(",", " ")
+
+
+def _business_markdown(
+    metrics: pd.DataFrame,
+    summary: pd.DataFrame,
+    windows: pd.DataFrame,
+) -> str:
+    """Create a decision-oriented report, not a dump of technical metrics."""
+    metric_values = _format_month_columns(metrics)
+    window_values = _format_month_columns(windows)
+    periods = int(window_values["fold"].nunique()) if not window_values.empty else 0
+    test_months = sorted(metric_values["test_month"].dropna().astype(str).unique())
+    models_count = int(summary["model"].nunique()) if not summary.empty else 0
+
+    winner_rows: List[List[str]] = []
+    executive_lines: List[str] = []
+    monthly_rows: List[List[str]] = []
+    for flow_id, flow_name in FLOW_NAMES_RU.items():
+        candidates = summary[summary["flow"].eq(flow_id)].sort_values(
+            "aggregate_mape_mean_percent"
+        )
+        if candidates.empty:
+            continue
+        winner = candidates.iloc[0]
+        winner_id = str(winner["model"])
+        winner_name = model_name_ru(winner_id)
+        winner_metrics = metric_values[
+            metric_values["flow"].eq(flow_id) & metric_values["model"].eq(winner_id)
+        ].sort_values("test_month")
+        absolute_gap = (
+            winner_metrics["predicted_total"] - winner_metrics["actual_total"]
+        ).abs()
+        mean_gap = float(absolute_gap.mean()) if not absolute_gap.empty else float("nan")
+        worst_gap = float(absolute_gap.max()) if not absolute_gap.empty else float("nan")
+        worst_month = "н/д"
+        if not winner_metrics.empty:
+            worst_index = winner_metrics["aggregate_mape_percent"].idxmax()
+            worst_month = str(winner_metrics.loc[worst_index, "test_month"])
+
+        baseline = candidates[candidates["model"].eq("trailing_mean")]
+        baseline_mape = (
+            float(baseline.iloc[0]["aggregate_mape_mean_percent"])
+            if not baseline.empty else float("nan")
+        )
+        winner_mape = float(winner["aggregate_mape_mean_percent"])
+        improvement_pp = baseline_mape - winner_mape
+        improvement_text = "нет baseline"
+        if not pd.isna(baseline_mape):
+            relative = improvement_pp / max(abs(baseline_mape), 1e-9) * 100.0
+            improvement_text = "{} п.п. ({}%)".format(
+                _number_ru(improvement_pp, sign=True), _number_ru(relative, sign=True)
+            )
+
+        stability = _stability_label(
+            winner["aggregate_mape_mean_percent"], winner["aggregate_mape_std_percent"]
+        )
+        winner_rows.append([
+            flow_name,
+            winner_name,
+            _number_ru(winner_mape) + "%",
+            _number_ru(winner["aggregate_mape_worst_percent"]) + "%",
+            stability,
+            _number_ru(winner["bias_mean_percent"], sign=True) + "%",
+            _money_ru(mean_gap),
+            _money_ru(worst_gap),
+            improvement_text,
+        ])
+
+        if baseline.empty:
+            decision = (
+                "Простой прогноз по среднему в этом запуске не проверялся, поэтому "
+                "преимущество модели над baseline пока не доказано."
+            )
+        elif winner_id == "trailing_mean":
+            decision = (
+                "Сложные модели не превзошли простой прогноз по среднему; для этого "
+                "потока разумно оставить baseline до улучшения признаков или данных."
+            )
+        else:
+            decision = (
+                "Модель лучше простого прогноза по среднему на **{}**. Перед рабочим "
+                "использованием нужно сопоставить худшую ошибку и денежное отклонение "
+                "с утверждённым бизнес-допуском."
+            ).format(improvement_text)
+        executive_lines.extend([
+            "- **{}:** рекомендуемая по тесту модель — **{}**. Средняя ошибка общей "
+            "месячной суммы **{}%**, худшая — **{}%** ({}), среднее абсолютное "
+            "денежное отклонение **{}**. {}".format(
+                flow_name,
+                winner_name,
+                _number_ru(winner_mape),
+                _number_ru(winner["aggregate_mape_worst_percent"]),
+                worst_month,
+                _money_ru(mean_gap),
+                decision,
+            )
+        ])
+
+        for _, row in winner_metrics.iterrows():
+            gap = float(row["predicted_total"] - row["actual_total"])
+            monthly_rows.append([
+                str(row["test_month"]),
+                flow_name,
+                winner_name,
+                _money_ru(row["actual_total"]),
+                _money_ru(row["predicted_total"]),
+                _money_ru(gap),
+                _number_ru(row["aggregate_mape_percent"]) + "%",
+                _number_ru(row["wape_percent"]) + "%",
+            ])
+
+    lines = [
+        "# Бизнес-отчёт по качеству прогноза денежных потоков",
+        "",
+        "## Резюме для принятия решения",
+        "",
+    ]
+    lines.extend(executive_lines or ["Результатов для формирования вывода нет."])
+    lines.extend([
+        "",
+        "> **Важно:** «лучшая модель» означает лучшую среди проверенных моделей на "
+        "исторических тестовых месяцах. Это не автоматическое разрешение на запуск "
+        "в промышленную эксплуатацию: сначала бизнес должен утвердить допустимую "
+        "ошибку в процентах и рублях.",
+        "",
+        "## Что было проверено",
+        "",
+        "- Тестовых месяцев: **{}**.".format(periods),
+        "- Проверено моделей: **{}**.".format(models_count),
+        "- Тестовый диапазон: **{}**.".format(
+            "{} — {}".format(test_months[0], test_months[-1]) if test_months else "н/д"
+        ),
+        "- Метод проверки: для каждого месяца модель обучалась только на прошлом; "
+        "тестовый месяц в обучение не попадал.",
+        "- Прогнозируемые показатели: общая сумма зачислений и общая сумма списаний "
+        "по каждому ИНН за календарный месяц.",
+        "",
+        "## Рекомендуемые модели",
+        "",
+    ])
+    lines.extend(_markdown_table(
+        [
+            "Поток", "Модель", "Средняя ошибка", "Худшая ошибка", "Стабильность",
+            "Смещение", "Средняя ошибка в рублях", "Максимальная ошибка в рублях",
+            "Улучшение к baseline",
+        ],
+        winner_rows,
+    ))
+
+    lines.extend(["", "## Полный рейтинг моделей", ""])
+    for flow_id, flow_name in FLOW_NAMES_RU.items():
+        lines.extend(["### {}".format(flow_name), ""])
+        ranking_rows: List[List[str]] = []
+        candidates = summary[summary["flow"].eq(flow_id)].sort_values(
+            "aggregate_mape_mean_percent"
+        )
+        for place, (_, row) in enumerate(candidates.iterrows(), start=1):
+            ranking_rows.append([
+                str(place),
+                model_name_ru(row["model"]),
+                _number_ru(row["aggregate_mape_mean_percent"]) + "%",
+                _number_ru(row["aggregate_mape_std_percent"]) + " п.п.",
+                _number_ru(row["aggregate_mape_worst_percent"]) + "%",
+                _number_ru(row["wape_mean_percent"]) + "%",
+                _number_ru(row["bias_mean_percent"], sign=True) + "%",
+            ])
+        lines.extend(_markdown_table(
+            ["Место", "Модель", "Средний MAPE", "Разброс", "Худший месяц", "WAPE", "Смещение"],
+            ranking_rows,
+        ))
+        lines.append("")
+
+    lines.extend([
+        "## Результат победителей по месяцам",
+        "",
+    ])
+    lines.extend(_markdown_table(
+        ["Месяц", "Поток", "Модель", "Факт", "Прогноз", "Отклонение", "MAPE", "WAPE"],
+        monthly_rows,
+    ))
+
+    lines.extend([
+        "",
+        "## Как читать показатели",
+        "",
+        "- **Средний MAPE общей суммы** — средняя ошибка общей суммы потока за месяц. "
+        "Это основной KPI для планирования совокупной ликвидности.",
+        "- **Худшая ошибка** — максимальный MAPE за один тестовый месяц. Этот показатель "
+        "показывает риск, который скрывается за средним значением.",
+        "- **Ошибка в рублях** — абсолютная разница между общей прогнозной и фактической "
+        "суммой. Именно её нужно сопоставлять с финансовым допуском бизнеса.",
+        "- **WAPE** — ошибка по отдельным ИНН без взаимной компенсации завышений и "
+        "занижений разных клиентов. Для поклиентских решений ориентируйтесь на WAPE.",
+        "- **Смещение**: плюс означает систематическое завышение, минус — занижение. "
+        "Для управления ликвидностью опасно устойчивое занижение будущих списаний.",
+        "- **Стабильность** в отчёте является относительной оценкой разброса ошибки: "
+        "до 25% от среднего — стабильная, 25–50% — умеренно стабильная, выше 50% — нестабильная.",
+        "",
+        "## Ограничения и бизнес-риски",
+        "",
+        "1. Модель прогнозирует денежные потоки, но не сам кассовый разрыв. Для расчёта "
+        "кассового разрыва нужны остаток на начало месяца, обязательные платежи и кредитные лимиты.",
+        "2. Хорошая ошибка общей суммы не гарантирует точность по конкретному ИНН: "
+        "ошибки клиентов могут компенсировать друг друга.",
+        "3. Результат относится к указанным историческим месяцам. После изменения "
+        "поведения клиентов или структуры портфеля качество нужно проверять повторно.",
+        "4. До внедрения следует зафиксировать два SLA: допустимый средний MAPE и "
+        "максимально допустимую ошибку в рублях в худшем месяце.",
+        "",
+        "## Файлы для работы",
+        "",
+        "- `01_рейтинг_моделей.csv` — компактная таблица для выбора модели.",
+        "- `02_качество_по_месяцам.csv` — факт, прогноз и ошибка каждого месяца.",
+        "- `03_окна_тестирования.csv` — периоды обучения, валидации и теста.",
+        "- `04_чистый_поток_по_месяцам.csv` — факт и прогноз чистого потока и правильность его знака.",
+        "- `отчет_прогнозы_по_инн.parquet` — детализация по ИНН без ограничения Excel.",
+        "- `monthly_*.csv` и `monthly_predictions.parquet` — технические исходные отчёты "
+        "для аналитиков и воспроизводимости.",
+    ])
+    return "\n".join(lines) + "\n"
+
+
 def write_russian_reports(
     output: Path,
     metrics: pd.DataFrame,
@@ -350,14 +666,24 @@ def write_russian_reports(
 ) -> None:
     """Write human-facing Russian artifacts while keeping technical files compatible."""
     output.mkdir(parents=True, exist_ok=True)
-    _write_csv(russian_summary(summary), output / "отчет_стабильность_моделей.csv")
-    _write_csv(russian_metrics(metrics), output / "отчет_метрики_по_периодам.csv")
-    _write_csv(russian_windows(windows), output / "отчет_окна_тестирования.csv")
+    ranking = russian_summary(summary)
+    monthly_quality = russian_metrics(metrics)
+    test_windows = russian_windows(windows)
+    net_flow = russian_net_flow(metrics)
+    for filename in ("01_рейтинг_моделей.csv", "отчет_стабильность_моделей.csv"):
+        _write_csv(ranking, output / filename)
+    for filename in ("02_качество_по_месяцам.csv", "отчет_метрики_по_периодам.csv"):
+        _write_csv(monthly_quality, output / filename)
+    for filename in ("03_окна_тестирования.csv", "отчет_окна_тестирования.csv"):
+        _write_csv(test_windows, output / filename)
+    if not net_flow.empty:
+        _write_csv(net_flow, output / "04_чистый_поток_по_месяцам.csv")
     _write_russian_predictions(predictions_path, output / "отчет_прогнозы_по_инн.parquet")
     periods = int(windows["fold"].nunique()) if not windows.empty else 0
     (output / "бизнес_вывод.txt").write_text(
         _business_conclusion(summary, periods), encoding="utf-8"
     )
-    (output / "краткий_отчет.md").write_text(
-        _markdown_summary(metrics, summary, windows), encoding="utf-8"
-    )
+    report = _business_markdown(metrics, summary, windows)
+    (output / "бизнес_отчет.md").write_text(report, encoding="utf-8")
+    # Keep the old filename as a compatibility alias, but its contents are now the full report.
+    (output / "краткий_отчет.md").write_text(report, encoding="utf-8")
