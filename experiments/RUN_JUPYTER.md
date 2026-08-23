@@ -265,6 +265,57 @@ subprocess.run([
 ], check=True)
 ```
 
+### Стабильный режим при `RuntimeError: exit code -11`
+
+Код `-11` означает нативный `SIGSEGV`, а не Python exception. Если даже
+изолированный benchmark падает на 10 периодах, не используйте для этого запуска
+`benchmark_monthly_isolated.py`. Запускайте специальный Torch-only pipeline:
+
+```python
+%run experiments/benchmark_torch_sequential.py \
+  --outflow "/data/outflow.parquet" \
+  --inflow "/data/inflow.parquet" \
+  --output-dir "./artifacts/torch_10_sequential" \
+  --model torch_mlp_2_layers \
+  --test-periods 10 \
+  --min-train-months 12 \
+  --epochs 100 \
+  --batch-size 32768 \
+  --layers 4096,2048 \
+  --devices cuda:0,cuda:1 \
+  --cpu-threads 8 \
+  --amp
+```
+
+Здесь нет флага `--parallel`. Периоды идут строго по одному: первый на
+`cuda:0`, второй на `cuda:1`, третий снова на `cuda:0` и так далее. Активная GPU
+получает широкую сеть `4096,2048`, большой batch и AMP/Tensor Cores. Вторая GPU
+в этот момент намеренно свободна — это плата за максимально устойчивый режим.
+
+Главное отличие от прежнего isolated runner: PyArrow/pandas готовят данные один
+раз в родительском процессе без CUDA. Каждый test-период запускается в новом
+worker, который импортирует только NumPy и PyTorch, читает `.npy` и после записи
+результатов завершает процесс без проблемного native CUDA cleanup.
+
+Если сервер или конкретный worker всё-таки завершится, повторите ту же команду,
+добавив:
+
+```text
+--resume
+```
+
+Уже завершённые периоды и подготовленные Parquet не пересчитываются. Подробный
+лог и автоматическая диагностика сигнала находятся здесь:
+
+```text
+artifacts/torch_10_sequential/sequential_folds/fold_XX_YYYYMM/worker.log
+artifacts/torch_10_sequential/sequential_folds/fold_XX_YYYYMM/failure_diagnostics.txt
+```
+
+В `worker.log` каждые пять эпох выводятся загрузка GPU, VRAM, мощность и
+температура. Все итоговые русские отчёты записываются прямо в
+`artifacts/torch_10_sequential`.
+
 ## 7. Посмотреть результаты базового обучения
 
 Итоговый рейтинг моделей:

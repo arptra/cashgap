@@ -149,9 +149,15 @@ def run_child(command: List[str], log_path: Path) -> None:
             log_file.write(line)
         return_code = process.wait()
     if return_code != 0:
+        hint = ""
+        if return_code == -11:
+            hint = (
+                " Это нативный SIGSEGV. Для одной Torch MLP используйте "
+                "experiments/benchmark_torch_sequential.py: он не смешивает PyArrow и CUDA."
+            )
         raise RuntimeError(
-            "Дочерний процесс периода завершился с кодом {}. Постоянный лог: {}".format(
-                return_code, log_path.resolve()
+            "Дочерний процесс периода завершился с кодом {}. Постоянный лог: {}.{}".format(
+                return_code, log_path.resolve(), hint
             )
         )
 
