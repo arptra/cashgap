@@ -1,0 +1,336 @@
+# Запуск экспериментов cash-flow в Jupyter
+
+Инструкция рассчитана на Linux EL8, Python 3.8, две NVIDIA GPU и два исходных
+Parquet-файла:
+
+- `outflow.parquet`: `tr_date`, `dt_inn`, `tr_sum` — списания;
+- `inflow.parquet`: `tr_date`, `kt_inn`, `tr_sum` — зачисления.
+
+`tr_date` может быть числом вида `20250530`: скрипты распознают формат
+`YYYYMMDD` автоматически.
+
+Все команды ниже выполняются в отдельных ячейках Jupyter. Замените пути
+`/data/outflow.parquet` и `/data/inflow.parquet` на реальные.
+
+## 1. Получить последнюю версию проекта
+
+Если репозиторий уже склонирован:
+
+```python
+%cd /путь/до/cashgap
+!git pull origin master
+```
+
+Если репозитория на сервере ещё нет:
+
+```python
+%cd /папка/для/проекта
+!git clone https://github.com/arptra/cashgap.git
+%cd cashgap
+```
+
+## 2. Проверить Python и GPU
+
+```python
+import sys
+import torch
+
+print("Python:", sys.version)
+print("Torch:", torch.__version__)
+print("CUDA доступна:", torch.cuda.is_available())
+print("Количество GPU:", torch.cuda.device_count())
+
+for index in range(torch.cuda.device_count()):
+    print(index, torch.cuda.get_device_name(index))
+```
+
+Дополнительно:
+
+```python
+!nvidia-smi
+```
+
+Ожидаемый результат: `CUDA доступна: True`, количество GPU — `2`.
+
+## 3. Установить недостающие библиотеки
+
+Каждый скрипт сначала сам проверяет зависимости и при ошибке печатает команду
+установки. Для полной установки под Python 3.8 можно выполнить:
+
+```python
+%pip install numpy pandas pyarrow scikit-learn threadpoolctl "xgboost==2.1.4" "optuna==3.6.2"
+```
+
+Torch с CUDA 12.1:
+
+```python
+%pip install "torch==2.3.1" --index-url https://download.pytorch.org/whl/cu121
+```
+
+Если драйвер рассчитан на CUDA 11.8:
+
+```python
+%pip install "torch==2.3.1" --index-url https://download.pytorch.org/whl/cu118
+```
+
+После установки обязательно перезапустите kernel Jupyter и повторите проверку
+из раздела 2. Одновременно устанавливать варианты `cu121` и `cu118` не нужно.
+
+## 4. Проверить структуру Parquet
+
+```python
+import pyarrow.parquet as pq
+
+OUTFLOW = "/data/outflow.parquet"
+INFLOW = "/data/inflow.parquet"
+
+print("OUTFLOW")
+print(pq.read_schema(OUTFLOW))
+print("INFLOW")
+print(pq.read_schema(INFLOW))
+```
+
+В первом файле должны быть `tr_date`, `dt_inn`, `tr_sum`, во втором —
+`tr_date`, `kt_inn`, `tr_sum`.
+
+## 5. Быстрый пробный запуск
+
+Этот запуск проверяет весь pipeline на небольшой части ИНН и двух тестовых
+месяцах. Его результаты не используются как итоговые.
+
+```python
+%run experiments/benchmark_monthly_cashflow.py \
+  --outflow "/data/outflow.parquet" \
+  --inflow "/data/inflow.parquet" \
+  --output-dir "./artifacts/monthly_smoke" \
+  --models trailing_mean,linear_regression,gradient_boosting,torch_mlp_2_layers,torch_mlp_3_layers \
+  --test-periods 2 \
+  --min-train-months 12 \
+  --max-inns 1000 \
+  --epochs 3 \
+  --batch-size 32768 \
+  --parallel \
+  --mlp2-device cuda:0 \
+  --mlp3-device cuda:1
+```
+
+## 6. Полное базовое обучение и проверка на 10 месяцах
+
+Это основной первый запуск. В каждом из десяти fold модели обучаются только на
+прошлом, а затем проверяются на очередном будущем месяце. MLP из двух слоёв
+работает на `cuda:0`, MLP из трёх слоёв — на `cuda:1`; линейная регрессия,
+прогноз по среднему и gradient boosting работают на CPU.
+
+```python
+%run experiments/benchmark_monthly_cashflow.py \
+  --outflow "/data/outflow.parquet" \
+  --inflow "/data/inflow.parquet" \
+  --output-dir "./artifacts/monthly_benchmark_base" \
+  --models trailing_mean,linear_regression,gradient_boosting,torch_mlp_2_layers,torch_mlp_3_layers \
+  --test-periods 10 \
+  --min-train-months 12 \
+  --epochs 100 \
+  --batch-size 32768 \
+  --parallel \
+  --mlp2-device cuda:0 \
+  --mlp3-device cuda:1
+```
+
+Результаты сохраняются в `artifacts/monthly_benchmark_base`:
+
+- `monthly_stability_summary.csv` — среднее качество и стабильность за 10 месяцев;
+- `monthly_fold_metrics.csv` — метрики каждого месяца;
+- `monthly_fold_windows.csv` — границы train/validation/test;
+- `monthly_predictions.parquet` — факт и прогноз по каждому ИНН;
+- `run_config.json` — параметры запуска.
+
+## 7. Посмотреть результаты базового обучения
+
+Итоговый рейтинг моделей:
+
+```python
+import pandas as pd
+
+summary = pd.read_csv(
+    "./artifacts/monthly_benchmark_base/monthly_stability_summary.csv"
+)
+display(summary.sort_values(["flow", "aggregate_mape_mean_percent"]))
+```
+
+Метрики всех десяти месяцев:
+
+```python
+fold_metrics = pd.read_csv(
+    "./artifacts/monthly_benchmark_base/monthly_fold_metrics.csv"
+)
+display(fold_metrics.head(30))
+```
+
+Факт и прогноз по ИНН:
+
+```python
+predictions = pd.read_parquet(
+    "./artifacts/monthly_benchmark_base/monthly_predictions.parquet"
+)
+display(predictions.sample(min(20, len(predictions))))
+```
+
+Основной показатель — `aggregate_mape_mean_percent`: средняя процентная ошибка
+совокупных зачислений или списаний за месяц. Чем меньше, тем лучше.
+`aggregate_mape_std_percent` показывает стабильность, а
+`aggregate_mape_worst_percent` — ошибку в худшем тестовом месяце.
+
+## 8. Автотюнинг MLP на двух GPU
+
+Финальные 10 месяцев защищены от автотюнинга. Два Optuna trial запускаются
+параллельно: один на `cuda:0`, второй на `cuda:1`.
+
+```python
+%run experiments/autotune_cashflow.py \
+  --model mlp \
+  --outflow "/data/outflow.parquet" \
+  --inflow "/data/inflow.parquet" \
+  --output-dir "./artifacts/cashflow_tuning/mlp" \
+  --trials 30 \
+  --jobs 2 \
+  --devices cuda:0,cuda:1 \
+  --tuning-periods 3 \
+  --holdout-test-periods 10 \
+  --min-train-months 12 \
+  --epochs 70
+```
+
+Лучшие параметры сохранятся в:
+
+```text
+artifacts/cashflow_tuning/mlp/best_params.json
+```
+
+Повторный запуск той же команды продолжает существующее Optuna study и добавляет
+ещё указанное количество trials.
+
+## 9. Автотюнинг gradient boosting
+
+Gradient boosting из этого эксперимента обучается на CPU.
+
+```python
+%run experiments/autotune_cashflow.py \
+  --model gradient_boosting \
+  --outflow "/data/outflow.parquet" \
+  --inflow "/data/inflow.parquet" \
+  --output-dir "./artifacts/cashflow_tuning/gradient_boosting" \
+  --trials 40 \
+  --jobs 2 \
+  --tuning-periods 3 \
+  --holdout-test-periods 10 \
+  --min-train-months 12
+```
+
+Лучшие параметры сохранятся в:
+
+```text
+artifacts/cashflow_tuning/gradient_boosting/best_params.json
+```
+
+## 10. Финальное сравнение с подобранными настройками
+
+Tuned MLP запускается на `cuda:0`, обычная трёхслойная MLP — на `cuda:1`.
+Базовая двухслойная сеть здесь не запускается повторно: её результат уже есть в
+`monthly_benchmark_base`.
+
+```python
+%run experiments/benchmark_monthly_cashflow.py \
+  --outflow "/data/outflow.parquet" \
+  --inflow "/data/inflow.parquet" \
+  --output-dir "./artifacts/monthly_benchmark_tuned" \
+  --models trailing_mean,linear_regression,gradient_boosting,torch_mlp_3_layers,torch_mlp_tuned \
+  --test-periods 10 \
+  --min-train-months 12 \
+  --epochs 100 \
+  --batch-size 32768 \
+  --parallel \
+  --mlp2-device cuda:0 \
+  --mlp3-device cuda:1 \
+  --mlp-params "./artifacts/cashflow_tuning/mlp/best_params.json" \
+  --boosting-params "./artifacts/cashflow_tuning/gradient_boosting/best_params.json"
+```
+
+Посмотреть финальный рейтинг:
+
+```python
+final_summary = pd.read_csv(
+    "./artifacts/monthly_benchmark_tuned/monthly_stability_summary.csv"
+)
+display(final_summary.sort_values(["flow", "aggregate_mape_mean_percent"]))
+```
+
+## 11. Дневной прогноз риска отрицательного чистого потока
+
+Это отдельный эксперимент. Он прогнозирует на 14 дней вероятность того, что
+дневной чистый поток будет отрицательным, а также приход, расход и чистый поток.
+Это proxy ликвидности, а не настоящий кассовый разрыв: без остатков на счетах
+нельзя определить, хватит ли денег.
+
+Обучение:
+
+```python
+%run experiments/train_cashflow_proxy.py train \
+  --outflow "/data/outflow.parquet" \
+  --inflow "/data/inflow.parquet" \
+  --output-dir "./artifacts/cashflow_daily" \
+  --horizon 14 \
+  --test-days 90 \
+  --validation-days 90 \
+  --epochs 120 \
+  --batch-size 4096 \
+  --parallel \
+  --mlp2-device cuda:0 \
+  --mlp3-device cuda:1
+```
+
+Показать случайный реальный пример из скрытой исторической test-выборки без
+повторного обучения:
+
+```python
+%run experiments/train_cashflow_proxy.py demo \
+  --output-dir "./artifacts/cashflow_daily" \
+  --demo-model best
+```
+
+Каждый новый запуск `demo` выбирает другой случай. Для воспроизводимого примера:
+
+```python
+%run experiments/train_cashflow_proxy.py demo \
+  --output-dir "./artifacts/cashflow_daily" \
+  --demo-model best \
+  --demo-seed 42
+```
+
+Обучить и сразу показать demo одной командой:
+
+```python
+%run experiments/train_cashflow_proxy.py train-demo \
+  --outflow "/data/outflow.parquet" \
+  --inflow "/data/inflow.parquet" \
+  --output-dir "./artifacts/cashflow_daily" \
+  --horizon 14 \
+  --epochs 120 \
+  --parallel \
+  --mlp2-device cuda:0 \
+  --mlp3-device cuda:1
+```
+
+## Что запускать по порядку
+
+1. Разделы 1–4 — обновление и проверка среды.
+2. Раздел 5 — быстрый пробный запуск.
+3. Разделы 6–7 — полное базовое обучение и проверка результата.
+4. Раздел 8 — автотюнинг MLP.
+5. Раздел 9 — автотюнинг gradient boosting.
+6. Раздел 10 — финальная честная проверка лучших настроек.
+7. Раздел 11 — отдельный дневной бизнес-demo, если он нужен.
+
+Месячный benchmark и дневной скрипт сохраняют реальные out-of-sample прогнозы и
+метрики. Сейчас они не сохраняют единый production-checkpoint для прогноза новых
+будущих данных: его следует обучать и сохранять отдельным финальным этапом после
+выбора победившей архитектуры.

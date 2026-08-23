@@ -46,6 +46,10 @@ Supervised-классификация разрешена только когда
 
 ## Быстрый старт
 
+Для экспериментов на двух Parquet-файлах (`dt_inn`/списания и
+`kt_inn`/зачисления), месячного MAPE, двух GPU, автотюнинга и дневного demo
+используйте отдельную [инструкцию запуска в Jupyter](experiments/RUN_JUPYTER.md).
+
 ```bash
 git clone https://github.com/arptra/cashgap.git
 cd cashgap
