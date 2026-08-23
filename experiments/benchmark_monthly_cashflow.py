@@ -71,6 +71,8 @@ if __name__ == "__main__":
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.linear_model import LinearRegression
 from sklearn.multioutput import MultiOutputRegressor
@@ -99,6 +101,28 @@ def peak_rss_gib() -> float:
     value = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
     # Linux reports KiB; macOS reports bytes.
     return value / (1024 ** 3) if sys.platform == "darwin" else value / (1024 ** 2)
+
+
+def current_rss_gib() -> float:
+    if sys.platform.startswith("linux"):
+        statm = Path("/proc/self/statm")
+        if statm.exists():
+            resident_pages = int(statm.read_text(encoding="utf-8").split()[1])
+            return resident_pages * os.sysconf("SC_PAGE_SIZE") / (1024 ** 3)
+    return peak_rss_gib()
+
+
+def release_fold_memory(devices: Sequence[str]) -> None:
+    gc.collect()
+    if importlib.util.find_spec("torch") is None:
+        return
+    import torch
+
+    if not torch.cuda.is_available():
+        return
+    for index in sorted({int(item.split(":", 1)[1]) for item in devices if item.startswith("cuda:")}):
+        torch.cuda.synchronize(index)
+        torch.cuda.empty_cache()
 
 
 def parse_args() -> argparse.Namespace:
@@ -595,7 +619,12 @@ def main() -> None:
         devices[0], list(args.mlp2_layers_parsed), devices[1], list(args.mlp3_layers_parsed)
     ))
 
-    metric_rows, prediction_rows, window_rows = [], [], []
+    metric_rows, window_rows = [], []
+    predictions_path = output / "monthly_predictions.parquet"
+    predictions_in_progress = output / "monthly_predictions.inprogress.parquet"
+    if predictions_in_progress.exists():
+        predictions_in_progress.unlink()
+    prediction_writer = None
     for fold_spec in fold_specs:
         fold = materialize_fold(monthly, fold_spec, features)
         fold_number = int(fold["fold"])
@@ -633,6 +662,7 @@ def main() -> None:
                 results[name] = run_model(name, fold, args, devices, jobs)
 
         actual = target_matrix(fold["test"])
+        fold_prediction_rows = []
         for name in models:
             prediction, seconds = results[name]
             for metric in regression_metrics(actual, prediction, args.mape_zero_floor):
@@ -643,7 +673,7 @@ def main() -> None:
                     "training_seconds": round(seconds, 3),
                     **metric,
                 })
-            prediction_rows.append(pd.DataFrame({
+            fold_prediction_rows.append(pd.DataFrame({
                 "fold": fold_number,
                 "test_month": test_month,
                 "inn": fold["test"]["inn"].astype(str).to_numpy(),
@@ -657,11 +687,26 @@ def main() -> None:
             print("  {:24s} | credit MAPE {:6.2f}% | debit MAPE {:6.2f}% | {:.1f}s".format(
                 name, primary[0]["aggregate_mape_percent"], primary[1]["aggregate_mape_percent"], seconds
             ))
-        del results, fold
-        gc.collect()
+        fold_predictions = pd.concat(fold_prediction_rows, ignore_index=True)
+        prediction_table = pa.Table.from_pandas(fold_predictions, preserve_index=False)
+        if prediction_writer is None:
+            prediction_writer = pq.ParquetWriter(
+                predictions_in_progress, prediction_table.schema, compression="snappy"
+            )
+        prediction_writer.write_table(prediction_table)
+        print("Fold predictions streamed: {:,} rows".format(len(fold_predictions)))
+        del results, fold, actual, prediction, fold_prediction_rows, fold_predictions, prediction_table
+        release_fold_memory(devices)
+        print("Memory after fold | current {:.2f} GiB | peak {:.2f} GiB".format(
+            current_rss_gib(), peak_rss_gib()
+        ))
+
+    if prediction_writer is None:
+        raise RuntimeError("No predictions were produced.")
+    prediction_writer.close()
+    os.replace(str(predictions_in_progress), str(predictions_path))
 
     metrics = pd.DataFrame(metric_rows)
-    predictions = pd.concat(prediction_rows, ignore_index=True)
     windows = pd.DataFrame(window_rows)
     summary = metrics.groupby(["model", "flow"], as_index=False).agg(
         aggregate_mape_mean_percent=("aggregate_mape_percent", "mean"),
@@ -675,7 +720,6 @@ def main() -> None:
     metrics.to_csv(output / "monthly_fold_metrics.csv", index=False)
     summary.to_csv(output / "monthly_stability_summary.csv", index=False)
     windows.to_csv(output / "monthly_fold_windows.csv", index=False)
-    predictions.to_parquet(output / "monthly_predictions.parquet", index=False)
     config = vars(args).copy()
     config["features"] = features
     (output / "run_config.json").write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
