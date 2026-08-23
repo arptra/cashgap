@@ -175,6 +175,39 @@ print(pq.read_schema(INFLOW))
 GPU нельзя гарантировать независимо от числа строк, но эти настройки увеличивают
 полезные матричные вычисления, не добавляя искусственный stress-нагрев.
 
+### Изолированный full-parallel режим при restart kernel
+
+Если один Jupyter-процесс стабилен только на трёх folds, используйте отдельный
+runner. Каждый тестовый месяц выполняется в новом дочернем Python-процессе, но
+внутри месяца все пять моделей по-прежнему запускаются параллельно. После fold
+операционная система полностью освобождает CUDA contexts, VRAM, native thread
+pools и RAM. Затем runner потоково объединяет результаты всех месяцев.
+
+```python
+%run experiments/benchmark_monthly_isolated.py \
+  --outflow "/data/outflow.parquet" \
+  --inflow "/data/inflow.parquet" \
+  --output-dir "./artifacts/monthly_benchmark_isolated" \
+  --models trailing_mean,linear_regression,gradient_boosting,torch_mlp_2_layers,torch_mlp_3_layers \
+  --test-periods 10 \
+  --min-train-months 12 \
+  --epochs 100 \
+  --batch-size 4096 \
+  --boosting-iterations 250 \
+  --cpu-threads 8 \
+  --parallel \
+  --mlp2-device cuda:0 \
+  --mlp3-device cuda:1 \
+  --mlp2-layers 512,256 \
+  --mlp3-layers 768,512,256
+```
+
+Объединённые файлы имеют те же имена, что у обычного benchmark. Постоянный лог
+каждого дочернего запуска хранится в
+`artifacts/monthly_benchmark_isolated/isolated_folds/fold_XX_offset_XX/child.log`.
+Если нативная библиотека или ОС завершит конкретный child, основной notebook
+останется жив, а runner покажет exit code и путь к последнему логу.
+
 ## 7. Посмотреть результаты базового обучения
 
 Итоговый рейтинг моделей:

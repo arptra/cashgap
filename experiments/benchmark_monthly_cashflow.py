@@ -131,6 +131,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--inflow", required=True, help="Parquet with tr_date, kt_inn, tr_sum")
     parser.add_argument("--output-dir", default="artifacts/monthly_benchmark")
     parser.add_argument("--test-periods", type=int, default=10)
+    parser.add_argument(
+        "--test-offset", type=int, default=0,
+        help="Shift the test window back by this many months; used by isolated runner",
+    )
     parser.add_argument("--min-train-months", type=int, default=12)
     parser.add_argument("--models", default=",".join(MODEL_NAMES[:-1]))
     parser.add_argument("--seed", type=int, default=42)
@@ -238,18 +242,23 @@ def build_monthly_dataset(daily: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]
 
 
 def rolling_month_folds(
-    frame: pd.DataFrame, test_periods: int, min_train_months: int,
+    frame: pd.DataFrame, test_periods: int, min_train_months: int, test_offset: int = 0,
 ) -> List[Dict[str, object]]:
     """Return lightweight time boundaries; fold DataFrames are built lazily."""
     months = [pd.Timestamp(value) for value in sorted(frame["month"].unique())]
-    if len(months) < min_train_months + test_periods + 1:
+    if test_offset < 0:
+        raise ValueError("--test-offset must be non-negative.")
+    required_months = min_train_months + test_periods + test_offset + 1
+    if len(months) < required_months:
         raise ValueError(
-            "Need at least {} distinct months for {} test periods; found {}.".format(
-                min_train_months + test_periods + 1, test_periods, len(months)
+            "Need at least {} distinct months for {} test periods at offset {}; found {}.".format(
+                required_months, test_periods, test_offset, len(months)
             )
         )
+    window_end = len(months) - test_offset
+    selected_test_months = months[window_end - test_periods:window_end]
     folds = []
-    for fold_index, test_month in enumerate(months[-test_periods:], start=1):
+    for fold_index, test_month in enumerate(selected_test_months, start=1):
         position = months.index(test_month)
         validation_month = months[position - 1]
         train_months = months[:position - 1]
@@ -602,8 +611,13 @@ def main() -> None:
     monthly, features = build_monthly_dataset(observed_daily)
     del observed_daily
     gc.collect()
-    fold_specs = rolling_month_folds(monthly, args.test_periods, args.min_train_months)
-    devices = resolve_devices(args.mlp2_device, args.mlp3_device, args.parallel)
+    fold_specs = rolling_month_folds(
+        monthly, args.test_periods, args.min_train_months, args.test_offset
+    )
+    if any(name.startswith("torch_") for name in models):
+        devices = resolve_devices(args.mlp2_device, args.mlp3_device, args.parallel)
+    else:
+        devices = ("cpu", "cpu")
     total_cpus = max(1, os.cpu_count() or 1)
     jobs = args.cpu_threads or (max(1, total_cpus // 4) if args.parallel else total_cpus)
     cpu_heavy_models = sum(name in {"linear_regression", "gradient_boosting"} for name in models)
