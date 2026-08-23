@@ -21,13 +21,52 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import importlib.util
 import json
 import os
 import random
 import secrets
+import shlex
+import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
+
+
+def _check_dependencies() -> None:
+    required = {
+        "numpy": "numpy",
+        "pandas": "pandas",
+        "pyarrow": "pyarrow",
+        "sklearn": "scikit-learn",
+    }
+    optional = {
+        "torch": "torch==2.3.1" if sys.version_info[:2] == (3, 8) else "torch",
+        "xgboost": "xgboost==2.1.4" if sys.version_info[:2] == (3, 8) else "xgboost",
+    }
+    missing_required = [package for module, package in required.items() if importlib.util.find_spec(module) is None]
+    missing_optional = [package for module, package in optional.items() if importlib.util.find_spec(module) is None]
+    executable = shlex.quote(sys.executable)
+    print("Dependency check | Python {} | {}".format(sys.version.split()[0], sys.executable))
+    if missing_required:
+        print("ERROR: missing required libraries: {}".format(", ".join(missing_required)))
+        print("Install: {} -m pip install {}".format(executable, " ".join(missing_required)))
+        print("Jupyter: %pip install {}".format(" ".join(missing_required)))
+        print("After installation restart the Jupyter kernel.")
+        raise SystemExit(2)
+    if missing_optional:
+        print("WARNING: unavailable optional models: {}".format(", ".join(missing_optional)))
+        print("Install: {} -m pip install {}".format(executable, " ".join(missing_optional)))
+        if any(package.startswith("torch") for package in missing_optional):
+            print("CUDA 11.8: {} -m pip install torch==2.3.1 --index-url https://download.pytorch.org/whl/cu118".format(executable))
+            print("CUDA 12.1: {} -m pip install torch==2.3.1 --index-url https://download.pytorch.org/whl/cu121".format(executable))
+        print("After installation restart the Jupyter kernel.")
+    else:
+        print("Dependency check: required and optional libraries are available.")
+
+
+if __name__ == "__main__":
+    _check_dependencies()
 
 import numpy as np
 import pandas as pd
@@ -63,10 +102,34 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def parse_transaction_dates(values: pd.Series) -> pd.Series:
+    """Parse strings, YYYYMMDD integers, Unix timestamps or epoch-day integers."""
+    if not pd.api.types.is_numeric_dtype(values):
+        return pd.to_datetime(values, errors="coerce").dt.normalize()
+
+    numeric = pd.to_numeric(values, errors="coerce")
+    non_null = numeric.dropna()
+    if non_null.empty:
+        return pd.to_datetime(values, errors="coerce").dt.normalize()
+
+    typical = float(non_null.abs().median())
+    if 10_000_000 <= typical <= 99_999_999:
+        # Common integer representation: 20240813 means 13 August 2024.
+        return pd.to_datetime(numeric.astype("Int64").astype("string"), format="%Y%m%d", errors="coerce").dt.normalize()
+    if 1_000_000_000 <= typical < 100_000_000_000:
+        return pd.to_datetime(numeric, unit="s", origin="unix", errors="coerce").dt.normalize()
+    if 100_000_000_000 <= typical < 100_000_000_000_000:
+        return pd.to_datetime(numeric, unit="ms", origin="unix", errors="coerce").dt.normalize()
+    if 10_000 <= typical < 1_000_000:
+        # Arrow/Parquet dates can be stored as a number of days since 1970-01-01.
+        return pd.to_datetime(numeric, unit="D", origin="unix", errors="coerce").dt.normalize()
+    return pd.to_datetime(values, errors="coerce").dt.normalize()
+
+
 def normalize(path: str, inn_column: str, value_name: str) -> pd.DataFrame:
     frame = pd.read_parquet(path, columns=["tr_date", inn_column, "tr_sum"])
     frame = frame.rename(columns={"tr_date": "date", inn_column: "inn", "tr_sum": value_name})
-    frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.normalize()
+    frame["date"] = parse_transaction_dates(frame["date"])
     frame["inn"] = frame["inn"].astype("string").str.strip()
     frame[value_name] = pd.to_numeric(frame[value_name], errors="coerce").fillna(0.0)
     frame = frame.dropna(subset=["date", "inn"])
@@ -202,7 +265,6 @@ def train_torch_multitask(
     """One multi-task MLP predicts H risks and H pairs of monetary flows."""
     import torch
     from torch import nn
-    from torch.utils.data import DataLoader, TensorDataset
 
     torch.manual_seed(seed)
     device = torch.device(device_name)
@@ -213,11 +275,20 @@ def train_torch_multitask(
     valid_negative, valid_flows = target_arrays(valid, horizon)
     flow_scale = np.maximum(np.nanpercentile(np.log1p(train_flows), 90, axis=0), 1.0).astype(np.float32)
 
-    x_train = torch.tensor(scaler.transform(X_train), dtype=torch.float32)
-    y_negative = torch.tensor(train_negative, dtype=torch.float32)
-    y_flows = torch.tensor(np.log1p(train_flows) / flow_scale, dtype=torch.float32)
-    loader = DataLoader(TensorDataset(x_train, y_negative, y_flows), batch_size=batch_size,
-                        shuffle=True, num_workers=0, pin_memory=device.type == "cuda")
+    # The prepared numeric dataset is small compared with modern GPU memory.
+    # Copy it once and form batches by GPU indices instead of transferring every
+    # batch from CPU. Raw parquet parsing and feature engineering remain on CPU.
+    x_train = torch.as_tensor(
+        scaler.transform(X_train).astype(np.float32, copy=False), device=device
+    )
+    y_negative = torch.as_tensor(train_negative, dtype=torch.float32, device=device)
+    y_flows = torch.as_tensor(
+        (np.log1p(train_flows) / flow_scale).astype(np.float32, copy=False), device=device
+    )
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+        allocated_gb = torch.cuda.memory_allocated(device) / (1024 ** 3)
+        print("  Dataset preloaded to {}: {:.2f} GiB".format(device, allocated_gb))
 
     modules = []
     width = X_train.shape[1]
@@ -252,10 +323,14 @@ def train_torch_multitask(
     best_loss, best_state, patience = float("inf"), None, 12
     for epoch in range(1, epochs + 1):
         model.train()
-        for batch_x, batch_negative, batch_flows in loader:
-            batch_x = batch_x.to(device, non_blocking=True)
-            batch_negative = batch_negative.to(device, non_blocking=True)
-            batch_flows = batch_flows.to(device, non_blocking=True)
+        generator = torch.Generator(device=device)
+        generator.manual_seed(seed + epoch)
+        permutation = torch.randperm(len(x_train), generator=generator, device=device)
+        for start in range(0, len(x_train), batch_size):
+            indices = permutation[start:start + batch_size]
+            batch_x = x_train[indices]
+            batch_negative = y_negative[indices]
+            batch_flows = y_flows[indices]
             optimizer.zero_grad()
             logits, flow_prediction = model(batch_x)
             loss = classification_loss(logits, batch_negative) + 0.35 * regression_loss(flow_prediction, batch_flows)
@@ -284,11 +359,13 @@ def train_torch_multitask(
     def predict(values: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
         model.eval()
         all_probabilities, all_flows = [], []
-        transformed = torch.tensor(scaler.transform(values), dtype=torch.float32)
-        prediction_loader = DataLoader(transformed, batch_size=batch_size, shuffle=False)
+        transformed = torch.as_tensor(
+            scaler.transform(values).astype(np.float32, copy=False), device=device
+        )
         with torch.no_grad():
-            for batch in prediction_loader:
-                logits, flow_prediction = model(batch.to(device))
+            for start in range(0, len(transformed), batch_size):
+                batch = transformed[start:start + batch_size]
+                logits, flow_prediction = model(batch)
                 all_probabilities.append(torch.sigmoid(logits).cpu().numpy())
                 all_flows.append(flow_prediction.cpu().numpy())
         probabilities = np.concatenate(all_probabilities)
