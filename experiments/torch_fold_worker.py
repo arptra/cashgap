@@ -67,6 +67,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cpu-threads", type=int, default=8)
     parser.add_argument("--mape-zero-floor", type=float, default=1.0)
     parser.add_argument("--amp", action="store_true")
+    parser.add_argument(
+        "--score-only", action="store_true",
+        help="Не сохранять поклиентские predictions во время автотюнинга",
+    )
     return parser.parse_args()
 
 
@@ -343,14 +347,15 @@ def main() -> None:
             "training_seconds": round(training_seconds, 3),
         })
 
-    atomic_npz(
-        output / "predictions.npz",
-        inn=np.asarray(inns[test_indices]),
-        actual_inflow=actual_test[:, 0],
-        predicted_inflow=prediction[:, 0],
-        actual_outflow=actual_test[:, 1],
-        predicted_outflow=prediction[:, 1],
-    )
+    if not args.score_only:
+        atomic_npz(
+            output / "predictions.npz",
+            inn=np.asarray(inns[test_indices]),
+            actual_inflow=actual_test[:, 0],
+            predicted_inflow=prediction[:, 0],
+            actual_outflow=actual_test[:, 1],
+            predicted_outflow=prediction[:, 1],
+        )
     atomic_json(output / "metrics.json", metric_rows)
     atomic_json(output / "window.json", {
         "fold": args.fold,

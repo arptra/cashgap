@@ -366,50 +366,69 @@ display(summary_ru)
 
 ## 8. Автотюнинг MLP на двух GPU
 
-Финальные 10 месяцев защищены от автотюнинга. Два Optuna trial запускаются
-параллельно: один на `cuda:0`, второй на `cuda:1`.
+Используйте устойчивый dispatcher. Он не импортирует CUDA в Jupyter-процесс,
+один раз готовит NumPy-массивы и запускает каждый fold в новом чистом
+PyTorch-процессе. Одновременно работает ровно по одному trial на GPU.
+Если конкретная комбинация падает через OOM/SIGSEGV, падает только её trial,
+а весь автотюнинг продолжается.
+
+Финальные 10 месяцев защищены от автотюнинга. Запуск:
 
 ```python
-%run experiments/autotune_cashflow.py \
-  --model mlp \
+%run experiments/autotune_torch_stable.py \
   --outflow "/data/outflow.parquet" \
   --inflow "/data/inflow.parquet" \
-  --output-dir "./artifacts/cashflow_tuning/mlp" \
+  --output-dir "./artifacts/cashflow_tuning_stable" \
   --trials 30 \
-  --jobs 2 \
   --devices cuda:0,cuda:1 \
   --tuning-periods 3 \
   --holdout-test-periods 10 \
   --min-train-months 12 \
-  --epochs 70
+  --epochs 70 \
+  --cpu-threads 8 \
+  --max-width 2048 \
+  --max-layers 6 \
+  --worker-timeout-minutes 180 \
+  --amp
 ```
 
-Лучшие параметры сохранятся в:
+Не добавляйте `--jobs`: число одновременных trials автоматически равно числу
+GPU в `--devices`. Лучшие параметры сохранятся в:
 
 ```text
-artifacts/cashflow_tuning/mlp/best_params.json
+artifacts/cashflow_tuning_stable/best_params.json
 ```
 
-Повторный запуск той же команды продолжает существующее Optuna study и добавляет
-ещё указанное количество trials.
+Текущее состояние всегда записано в `study.sqlite3`, `отчет_автотюнинг.csv` и
+`краткий_отчет_автотюнинг.md`. Лог каждого fold лежит в
+`trials/trial_XXXXX/fold_XX_YYYYMM/worker.log`; при падении рядом будет
+`failure_diagnostics.txt`.
 
-Для указанной конфигурации можно проводить более широкий поиск до шести слоёв и
-2048 нейронов в первом слое, запуская примерно четыре trials на каждой GPU:
+Повторный запуск той же команды не перечитывает Parquet, продолжает study и
+добавляет ещё указанное в `--trials` количество trials.
+
+Для более долгого поиска достаточно увеличить число trials и epochs:
 
 ```python
-%run experiments/autotune_cashflow.py \
-  --model mlp \
+%run experiments/autotune_torch_stable.py \
   --outflow "/data/outflow.parquet" \
   --inflow "/data/inflow.parquet" \
-  --output-dir "./artifacts/cashflow_tuning_full" \
+  --output-dir "./artifacts/cashflow_tuning_stable_full" \
   --trials 100 \
-  --jobs 8 \
   --devices cuda:0,cuda:1 \
   --tuning-periods 3 \
   --holdout-test-periods 10 \
   --min-train-months 12 \
-  --epochs 120
+  --epochs 120 \
+  --cpu-threads 8 \
+  --max-width 2048 \
+  --max-layers 6 \
+  --worker-timeout-minutes 180 \
+  --amp
 ```
+
+Старая команда `autotune_cashflow.py --model mlp` тоже автоматически
+перенаправляется в этот устойчивый режим, но новую команду выше читать проще.
 
 ## 9. Автотюнинг gradient boosting
 
@@ -453,7 +472,7 @@ Tuned MLP запускается на `cuda:0`, обычная трёхслой�
   --parallel \
   --mlp2-device cuda:0 \
   --mlp3-device cuda:1 \
-  --mlp-params "./artifacts/cashflow_tuning/mlp/best_params.json" \
+  --mlp-params "./artifacts/cashflow_tuning_stable/best_params.json" \
   --boosting-params "./artifacts/cashflow_tuning/gradient_boosting/best_params.json"
 ```
 

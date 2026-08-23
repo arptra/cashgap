@@ -22,6 +22,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -303,28 +304,36 @@ def worker_command(
     ]
     if args.amp:
         command.append("--amp")
+    if getattr(args, "score_only", False):
+        command.append("--score-only")
     return command
 
 
-def validate_fold_artifacts(fold_output: Path) -> Tuple[bool, str]:
+def validate_fold_artifacts(
+    fold_output: Path, require_predictions: bool = True,
+) -> Tuple[bool, str]:
     marker = fold_output / "SUCCESS"
     metrics_path = fold_output / "metrics.json"
     window_path = fold_output / "window.json"
     predictions_path = fold_output / "predictions.npz"
-    if not all(path.exists() for path in (marker, metrics_path, window_path, predictions_path)):
-        return False, "не хватает SUCCESS/metrics/window/predictions"
+    required_paths = [marker, metrics_path, window_path]
+    if require_predictions:
+        required_paths.append(predictions_path)
+    if not all(path.exists() for path in required_paths):
+        return False, "не хватает обязательных артефактов периода"
     try:
         metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
         window = json.loads(window_path.read_text(encoding="utf-8"))
-        with np.load(str(predictions_path), allow_pickle=False) as predictions:
-            required = {
-                "inn", "actual_inflow", "predicted_inflow", "actual_outflow", "predicted_outflow"
-            }
-            if not required.issubset(predictions.files):
-                return False, "в predictions.npz отсутствуют массивы"
-            lengths = {len(predictions[name]) for name in required}
-            if len(lengths) != 1 or next(iter(lengths)) < 1:
-                return False, "массивы predictions пустые или разной длины"
+        if require_predictions:
+            with np.load(str(predictions_path), allow_pickle=False) as predictions:
+                required = {
+                    "inn", "actual_inflow", "predicted_inflow", "actual_outflow", "predicted_outflow"
+                }
+                if not required.issubset(predictions.files):
+                    return False, "в predictions.npz отсутствуют массивы"
+                lengths = {len(predictions[name]) for name in required}
+                if len(lengths) != 1 or next(iter(lengths)) < 1:
+                    return False, "массивы predictions пустые или разной длины"
         if len(metrics) != 2 or int(window["test_rows"]) < 1:
             return False, "metrics/window неполные"
     except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
@@ -332,7 +341,10 @@ def validate_fold_artifacts(fold_output: Path) -> Tuple[bool, str]:
     return True, "OK"
 
 
-def run_worker(command: Sequence[str], log_path: Path, cpu_threads: int) -> int:
+def run_worker(
+    command: Sequence[str], log_path: Path, cpu_threads: int,
+    timeout_seconds: Optional[int] = None,
+) -> int:
     snapshot_before = nvidia_snapshot()
     print("GPU до запуска: {}".format(snapshot_before), flush=True)
     print("Команда worker: {}".format(" ".join(shlex.quote(part) for part in command)), flush=True)
@@ -347,10 +359,29 @@ def run_worker(command: Sequence[str], log_path: Path, cpu_threads: int) -> int:
             env=worker_env(cpu_threads),
         )
         assert process.stdout is not None
-        for line in process.stdout:
-            print(line, end="", flush=True)
-            log_file.write(line)
-        return_code = process.wait()
+
+        def copy_output() -> None:
+            assert process.stdout is not None
+            for line in process.stdout:
+                print(line, end="", flush=True)
+                log_file.write(line)
+
+        reader = threading.Thread(target=copy_output, name="torch-worker-log", daemon=True)
+        reader.start()
+        timeout_message: Optional[str] = None
+        try:
+            return_code = process.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            return_code = 124
+            timeout_message = "WORKER TIMEOUT после {} секунд; процесс остановлен.\n".format(
+                timeout_seconds
+            )
+        reader.join(timeout=30)
+        if timeout_message is not None:
+            print(timeout_message, end="", flush=True)
+            log_file.write(timeout_message)
         snapshot_after = nvidia_snapshot()
         log_file.write("\nGPU ПОСЛЕ ЗАПУСКА\n{}\n".format(snapshot_after))
     print("GPU после запуска: {}".format(snapshot_after), flush=True)

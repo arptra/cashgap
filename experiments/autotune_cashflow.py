@@ -25,6 +25,7 @@ import json
 import os
 import random
 import shlex
+import subprocess
 import sys
 from pathlib import Path
 from typing import Dict, List
@@ -154,6 +155,39 @@ def mlp_layers(trial) -> List[int]:
 
 def main() -> None:
     args = parse_args()
+    if args.model == "mlp":
+        stable = Path(__file__).with_name("autotune_torch_stable.py").resolve()
+        output_root = Path(args.output_dir)
+        output = output_root if output_root.name == "mlp" else output_root / "mlp"
+        devices = args.devices if args.devices != "auto" else "cuda:0"
+        command = [
+            sys.executable, "-X", "faulthandler", "-u", str(stable),
+            "--outflow", args.outflow,
+            "--inflow", args.inflow,
+            "--output-dir", str(output),
+            "--trials", str(args.trials),
+            "--devices", devices,
+            "--tuning-periods", str(args.tuning_periods),
+            "--holdout-test-periods", str(args.holdout_test_periods),
+            "--min-train-months", str(args.min_train_months),
+            "--epochs", str(args.epochs),
+            "--seed", str(args.seed),
+            "--mape-zero-floor", str(args.mape_zero_floor),
+        ]
+        if args.cpu_threads is not None:
+            command.extend(["--cpu-threads", str(args.cpu_threads)])
+        if args.max_inns is not None:
+            command.extend(["--max-inns", str(args.max_inns)])
+        print(
+            "MLP AUTOTUNE: старый in-process режим отключён; запускаю устойчивый "
+            "dispatcher с отдельным процессом на каждый fold. --jobs игнорируется: "
+            "одновременно работает не больше одного trial на каждую GPU.",
+            flush=True,
+        )
+        completed = subprocess.run(command, check=False)
+        if completed.returncode != 0:
+            raise SystemExit(completed.returncode)
+        return
     if args.model == "mlp" and importlib.util.find_spec("torch") is None:
         raise SystemExit(
             "MLP tuning requires torch. Install the CUDA command printed above, restart the kernel, and retry."
