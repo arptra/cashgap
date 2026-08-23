@@ -3,8 +3,8 @@
 Инструкция рассчитана на Linux EL8, Python 3.8, две NVIDIA GPU и два исходных
 Parquet-файла:
 
-- `outflow.parquet`: `tr_date`, `dt_inn`, `tr_sum` — списания;
-- `inflow.parquet`: `tr_date`, `kt_inn`, `tr_sum` — зачисления.
+- `outflow.parquet`: `tr_date`, `dt_inn` (или `dtinn`), `tr_sum` — списания;
+- `inflow.parquet`: `tr_date`, `kt_inn` (или `ktinn`), `tr_sum` — зачисления.
 
 `tr_date` может быть числом вида `20250530`: скрипты распознают формат
 `YYYYMMDD` автоматически.
@@ -90,8 +90,9 @@ print("INFLOW")
 print(pq.read_schema(INFLOW))
 ```
 
-В первом файле должны быть `tr_date`, `dt_inn`, `tr_sum`, во втором —
-`tr_date`, `kt_inn`, `tr_sum`.
+В первом файле должны быть `tr_date`, `dt_inn`/`dtinn`, `tr_sum`, во втором —
+`tr_date`, `kt_inn`/`ktinn`, `tr_sum`. Регистр, подчёркивания и другие знаки в
+именах при сопоставлении игнорируются.
 
 ## 5. Быстрый пробный запуск
 

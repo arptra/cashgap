@@ -126,9 +126,55 @@ def parse_transaction_dates(values: pd.Series) -> pd.Series:
     return pd.to_datetime(values, errors="coerce").dt.normalize()
 
 
+def _column_key(name: str) -> str:
+    """Compare schema names without case, underscores, spaces or punctuation."""
+    return "".join(character for character in str(name).casefold() if character.isalnum())
+
+
+def resolve_parquet_columns(path: str, expected: Sequence[str]) -> Dict[str, str]:
+    """Resolve common schema variants such as dt_inn/dtinn and kt_inn/ktinn."""
+    import pyarrow.dataset as arrow_dataset
+
+    available = list(arrow_dataset.dataset(path, format="parquet").schema.names)
+    normalized: Dict[str, List[str]] = {}
+    for actual in available:
+        normalized.setdefault(_column_key(actual), []).append(actual)
+
+    resolved: Dict[str, str] = {}
+    for requested in expected:
+        if requested in available:
+            resolved[requested] = requested
+            continue
+        matches = normalized.get(_column_key(requested), [])
+        if len(matches) == 1:
+            resolved[requested] = matches[0]
+            continue
+        if len(matches) > 1:
+            raise ValueError(
+                "Ambiguous parquet column {!r}: matches {}. Available columns: {}".format(
+                    requested, matches, available
+                )
+            )
+        raise ValueError(
+            "Required parquet column {!r} was not found in {}. Available columns: {}".format(
+                requested, path, available
+            )
+        )
+    return resolved
+
+
 def normalize(path: str, inn_column: str, value_name: str) -> pd.DataFrame:
-    frame = pd.read_parquet(path, columns=["tr_date", inn_column, "tr_sum"])
-    frame = frame.rename(columns={"tr_date": "date", inn_column: "inn", "tr_sum": value_name})
+    columns = resolve_parquet_columns(path, ["tr_date", inn_column, "tr_sum"])
+    selected = [columns["tr_date"], columns[inn_column], columns["tr_sum"]]
+    aliases = {
+        columns["tr_date"]: "date",
+        columns[inn_column]: "inn",
+        columns["tr_sum"]: value_name,
+    }
+    changed = ["{} -> {}".format(actual, expected) for expected, actual in columns.items() if actual != expected]
+    if changed:
+        print("Parquet column aliases | {} | {}".format(path, ", ".join(changed)))
+    frame = pd.read_parquet(path, columns=selected).rename(columns=aliases)
     frame["date"] = parse_transaction_dates(frame["date"])
     frame["inn"] = frame["inn"].astype("string").str.strip()
     frame[value_name] = pd.to_numeric(frame[value_name], errors="coerce").fillna(0.0)
