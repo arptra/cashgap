@@ -4,6 +4,8 @@
 Examples:
   python experiments/launch_training.py benchmark --outflow ... --inflow ... \
     --output-dir artifacts/torch_10 --test-periods 10
+  python experiments/launch_training.py full-benchmark --outflow ... --inflow ... \
+    --output-dir artifacts/all_models_10 --test-periods 10
   python experiments/launch_training.py autotune --outflow ... --inflow ... \
     --output-dir artifacts/tuning --trials 30
   python experiments/launch_training.py status --output-dir artifacts/torch_10
@@ -27,6 +29,7 @@ from typing import Dict, List, Optional, Sequence
 
 SCRIPT_BY_MODE = {
     "benchmark": "benchmark_torch_sequential.py",
+    "full-benchmark": "benchmark_monthly_isolated.py",
     "autotune": "autotune_torch_stable.py",
 }
 
@@ -248,7 +251,7 @@ def detach_current_script(
 def main() -> int:
     if len(sys.argv) < 2 or sys.argv[1] in {"-h", "--help"}:
         print(__doc__)
-        print("Режимы: benchmark, autotune, status")
+        print("Режимы: benchmark, full-benchmark, autotune, status")
         return 0
     mode = sys.argv[1]
     arguments = sys.argv[2:]

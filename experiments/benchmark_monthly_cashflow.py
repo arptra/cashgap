@@ -83,7 +83,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from sklearn.ensemble import HistGradientBoostingRegressor
-from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import Ridge
 from sklearn.multioutput import MultiOutputRegressor
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
@@ -92,9 +92,35 @@ from threadpoolctl import threadpool_limits
 try:
     from experiments.train_cashflow_proxy import build_observed_daily
     from experiments.monthly_reports_ru import russian_summary, write_russian_reports
+    from experiments.monthly_objective import (
+        MONTHLY_OBJECTIVE_NAME,
+        MONTHLY_OBJECTIVE_VERSION,
+        baseline_from_feature_matrix,
+        fit_feature_normalizer,
+        fit_residual_scale,
+        monthly_regression_metrics,
+        restore_residual_predictions,
+        normalize_features,
+        scale_residual_targets,
+        target_total_diagnostics,
+        validate_money_targets,
+    )
 except ImportError:
     from train_cashflow_proxy import build_observed_daily
     from monthly_reports_ru import russian_summary, write_russian_reports
+    from monthly_objective import (
+        MONTHLY_OBJECTIVE_NAME,
+        MONTHLY_OBJECTIVE_VERSION,
+        baseline_from_feature_matrix,
+        fit_feature_normalizer,
+        fit_residual_scale,
+        monthly_regression_metrics,
+        restore_residual_predictions,
+        normalize_features,
+        scale_residual_targets,
+        target_total_diagnostics,
+        validate_money_targets,
+    )
 
 
 TARGET_COLUMNS = ["target_inflow", "target_outflow"]
@@ -188,18 +214,16 @@ def build_monthly_dataset(daily: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]
     # Keep zero-activity calendar months, but expand only at month granularity.
     # The old daily expansion could turn sparse transactions into billions of
     # rows before they were immediately aggregated back to months.
-    bounds = monthly.groupby("inn", as_index=False).agg(
-        start_month=("month", "min"),
-        end_month=("month", "max"),
-    )
+    bounds = monthly.groupby("inn", as_index=False).agg(start_month=("month", "min"))
     all_months = pd.date_range(monthly["month"].min(), monthly["month"].max(), freq="MS")
     grid = pd.MultiIndex.from_product(
         [bounds["inn"].astype("string"), all_months], names=["inn", "month"]
     ).to_frame(index=False)
     grid = grid.merge(bounds, on="inn", how="left", validate="many_to_one")
-    grid = grid[
-        grid["month"].ge(grid["start_month"]) & grid["month"].le(grid["end_month"])
-    ][["inn", "month"]]
+    # A company remains in the observable population after its first transaction.
+    # Stopping its calendar at the last transaction uses future knowledge and drops
+    # dormant clients from later test months (survivorship leakage).
+    grid = grid[grid["month"].ge(grid["start_month"])][["inn", "month"]]
     monthly = grid.merge(monthly, on=["inn", "month"], how="left", validate="one_to_one")
     amount_columns = ["target_inflow", "target_outflow"]
     activity_columns = ["active_inflow_days", "active_outflow_days", "negative_days"]
@@ -320,11 +344,7 @@ def materialize_fold(
 
 
 def target_matrix(frame: pd.DataFrame) -> np.ndarray:
-    return frame[TARGET_COLUMNS].to_numpy(dtype=np.float64)
-
-
-def inverse_log_predictions(values: np.ndarray) -> np.ndarray:
-    return np.maximum(np.expm1(values), 0.0)
+    return validate_money_targets(frame[TARGET_COLUMNS].to_numpy(dtype=np.float64))
 
 
 def predict_trailing_mean(test: pd.DataFrame) -> np.ndarray:
@@ -337,10 +357,15 @@ def predict_trailing_mean(test: pd.DataFrame) -> np.ndarray:
 def predict_linear(
     X_train: pd.DataFrame, train: pd.DataFrame, X_test: pd.DataFrame, jobs: int,
 ) -> np.ndarray:
-    model = make_pipeline(StandardScaler(), LinearRegression(n_jobs=1))
+    baseline_train = baseline_from_feature_matrix(X_train.to_numpy(), list(X_train.columns))
+    baseline_test = baseline_from_feature_matrix(X_test.to_numpy(), list(X_test.columns))
+    # Ridge safely assigns zero coefficients to train-constant columns. Keeping
+    # them avoids the VarianceThreshold failure when an early fold contains no
+    # varying lag yet; the zero correction then falls back to the baseline.
+    model = make_pipeline(StandardScaler(), Ridge(alpha=1000.0))
     with threadpool_limits(limits=jobs):
-        model.fit(X_train, np.log1p(target_matrix(train)))
-    return inverse_log_predictions(model.predict(X_test))
+        model.fit(X_train, target_matrix(train) - baseline_train)
+    return np.maximum(baseline_test + model.predict(X_test), 0.0)
 
 
 def predict_boosting(
@@ -360,10 +385,12 @@ def predict_boosting(
         options.update(params)
     # Two targets do not justify spawning separate Python processes. The
     # underlying OpenMP math is limited explicitly to avoid CPU oversubscription.
+    baseline_train = baseline_from_feature_matrix(X_train.to_numpy(), list(X_train.columns))
+    baseline_test = baseline_from_feature_matrix(X_test.to_numpy(), list(X_test.columns))
     model = MultiOutputRegressor(HistGradientBoostingRegressor(**options), n_jobs=1)
     with threadpool_limits(limits=jobs):
-        model.fit(X_train, np.log1p(target_matrix(train)))
-    return inverse_log_predictions(model.predict(X_test))
+        model.fit(X_train, target_matrix(train) - baseline_train)
+    return np.maximum(baseline_test + model.predict(X_test), 0.0)
 
 
 def _activation(name: str):
@@ -392,16 +419,27 @@ def predict_torch_mlp(
         options.update(params)
     device = torch.device(device_name)
     torch.manual_seed(seed)
-    scaler = StandardScaler().fit(X_train)
-    x_train_np = scaler.transform(X_train).astype(np.float32, copy=False)
-    x_valid_np = scaler.transform(X_valid).astype(np.float32, copy=False)
-    x_test_np = scaler.transform(X_test).astype(np.float32, copy=False)
-    y_train_np = np.log1p(target_matrix(train)).astype(np.float32, copy=False)
-    y_valid_np = np.log1p(target_matrix(valid)).astype(np.float32, copy=False)
-    y_mean = y_train_np.mean(axis=0, keepdims=True)
-    y_scale = np.maximum(y_train_np.std(axis=0, keepdims=True), 1e-3)
-    y_train_np = (y_train_np - y_mean) / y_scale
-    y_valid_np = (y_valid_np - y_mean) / y_scale
+    feature_mean, feature_scale, active_features = fit_feature_normalizer(X_train.to_numpy())
+    x_train_np = normalize_features(
+        X_train.to_numpy(), feature_mean, feature_scale, active_features
+    )
+    x_valid_np = normalize_features(
+        X_valid.to_numpy(), feature_mean, feature_scale, active_features
+    )
+    x_test_np = normalize_features(
+        X_test.to_numpy(), feature_mean, feature_scale, active_features
+    )
+    # Learn a correction to the strong three-month-mean baseline. The output
+    # layer starts at zero, so an untrained MLP is exactly the baseline rather
+    # than an arbitrary multi-billion-ruble forecast.
+    baseline_train = baseline_from_feature_matrix(X_train.to_numpy(), list(X_train.columns))
+    baseline_valid = baseline_from_feature_matrix(X_valid.to_numpy(), list(X_valid.columns))
+    baseline_test = baseline_from_feature_matrix(X_test.to_numpy(), list(X_test.columns))
+    train_residual = target_matrix(train) - baseline_train
+    valid_residual = target_matrix(valid) - baseline_valid
+    residual_scale = fit_residual_scale(train_residual)
+    y_train_np = scale_residual_targets(train_residual, residual_scale)
+    y_valid_np = scale_residual_targets(valid_residual, residual_scale)
 
     # Everything numeric is copied once to VRAM. No batch performs a CPU->GPU copy.
     x_train = torch.as_tensor(x_train_np, device=device)
@@ -415,7 +453,10 @@ def predict_torch_mlp(
     for hidden in layers:
         modules.extend([nn.Linear(width, int(hidden)), activation_class(), nn.Dropout(float(options["dropout"]))])
         width = int(hidden)
-    modules.append(nn.Linear(width, 2))
+    output_layer = nn.Linear(width, 2)
+    nn.init.zeros_(output_layer.weight)
+    nn.init.zeros_(output_layer.bias)
+    modules.append(output_layer)
     model = nn.Sequential(*modules).to(device)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     print("    {} | слои={} | строк={:,} | batch={:,} | параметров={:,}".format(
@@ -425,8 +466,11 @@ def predict_torch_mlp(
         model.parameters(), lr=float(options["learning_rate"]),
         weight_decay=float(options["weight_decay"]),
     )
-    loss_function = nn.SmoothL1Loss()
-    best_loss, best_state = float("inf"), None
+    loss_function = nn.MSELoss()
+    model.eval()
+    with torch.no_grad():
+        best_loss = float(loss_function(model(x_valid), y_valid))
+    best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
     patience = int(options["patience"])
     remaining = patience
     started = time.perf_counter()
@@ -440,6 +484,7 @@ def predict_torch_mlp(
             optimizer.zero_grad()
             loss = loss_function(model(x_train[indices]), y_train[indices])
             loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
         model.eval()
         with torch.no_grad():
@@ -456,13 +501,12 @@ def predict_torch_mlp(
     model.eval()
     with torch.no_grad():
         prediction_scaled = model(x_test).cpu().numpy()
-    prediction_log = prediction_scaled * y_scale + y_mean
     if device.type == "cuda":
         allocated = torch.cuda.memory_allocated(device) / (1024 ** 3)
         print("    {}: эпоха={}, {:.2f} сек, VRAM {:.2f} GiB".format(
             device, epoch, time.perf_counter() - started, allocated
         ))
-    return inverse_log_predictions(prediction_log)
+    return restore_residual_predictions(baseline_test, prediction_scaled, residual_scale)
 
 
 def resolve_devices(mlp2: str, mlp3: str, parallel: bool) -> Tuple[str, str]:
@@ -500,35 +544,7 @@ def resolve_devices(mlp2: str, mlp3: str, parallel: bool) -> Tuple[str, str]:
 def regression_metrics(
     actual: np.ndarray, predicted: np.ndarray, zero_floor: float,
 ) -> List[Dict[str, float]]:
-    rows = []
-    for index, flow in enumerate(("inflow_credit", "outflow_debit")):
-        truth = actual[:, index].astype(float)
-        forecast = predicted[:, index].astype(float)
-        nonzero = np.abs(truth) > zero_floor
-        total_truth = float(truth.sum())
-        total_forecast = float(forecast.sum())
-        aggregate_mape = abs(total_forecast - total_truth) / max(abs(total_truth), zero_floor)
-        wape = np.abs(forecast - truth).sum() / max(np.abs(truth).sum(), zero_floor)
-        company_mape = (
-            float(np.mean(np.abs(forecast[nonzero] - truth[nonzero]) / np.abs(truth[nonzero])))
-            if nonzero.any() else float("nan")
-        )
-        rows.append({
-            "flow": flow,
-            "aggregate_mape": float(aggregate_mape),
-            "aggregate_mape_percent": float(aggregate_mape * 100),
-            "company_mape_nonzero": company_mape,
-            "company_mape_nonzero_percent": float(company_mape * 100),
-            "wape": float(wape),
-            "wape_percent": float(wape * 100),
-            "mae": float(np.mean(np.abs(forecast - truth))),
-            "bias_percent": float((total_forecast - total_truth) / max(abs(total_truth), zero_floor) * 100),
-            "actual_total": total_truth,
-            "predicted_total": total_forecast,
-            "nonzero_companies": int(nonzero.sum()),
-            "companies": int(len(truth)),
-        })
-    return rows
+    return monthly_regression_metrics(actual, predicted, zero_floor)
 
 
 def run_model(
@@ -576,6 +592,23 @@ def run_model(
     return prediction, time.perf_counter() - started
 
 
+def model_architecture(name: str, args: argparse.Namespace) -> str:
+    if name == "trailing_mean":
+        return "Среднее за предыдущие 3 месяца"
+    if name == "linear_regression":
+        return "Ridge-регрессия по поправке к среднему"
+    if name == "gradient_boosting":
+        return "HistGradientBoosting по поправке к среднему"
+    if name == "torch_mlp_2_layers":
+        return " → ".join(str(value) for value in args.mlp2_layers_parsed)
+    if name == "torch_mlp_3_layers":
+        return " → ".join(str(value) for value in args.mlp3_layers_parsed)
+    if name == "torch_mlp_tuned":
+        tuned = getattr(args, "mlp_tuned_params", None) or {}
+        return " → ".join(str(value) for value in tuned.get("layers", []))
+    return name
+
+
 def validate_models(value: str) -> List[str]:
     models = [item.strip() for item in value.split(",") if item.strip()]
     unknown = sorted(set(models) - set(MODEL_NAMES))
@@ -602,6 +635,14 @@ def load_tuned_params(path: Optional[str], expected_model: str) -> Optional[Dict
         raise ValueError("{} contains model={!r}, expected {!r}".format(
             path, payload.get("model"), expected_model
         ))
+    if payload.get("objective_version") != MONTHLY_OBJECTIVE_VERSION:
+        raise ValueError(
+            "{} создан для старой целевой функции (version={!r}); требуется version={}. "
+            "Старые параметры после исправления денежного target использовать нельзя — "
+            "запустите автотюнинг в новом --output-dir.".format(
+                path, payload.get("objective_version"), MONTHLY_OBJECTIVE_VERSION
+            )
+        )
     return dict(payload["best_params"])
 
 
@@ -699,6 +740,7 @@ def main() -> None:
                     "test_month": test_month,
                     "model": name,
                     "training_seconds": round(seconds, 3),
+                    "architecture": model_architecture(name, args),
                     **metric,
                 })
             fold_prediction_rows.append(pd.DataFrame({
@@ -737,11 +779,12 @@ def main() -> None:
     metrics = pd.DataFrame(metric_rows)
     windows = pd.DataFrame(window_rows)
     summary = metrics.groupby(["model", "flow"], as_index=False).agg(
+        architecture=("architecture", "first"),
         aggregate_mape_mean_percent=("aggregate_mape_percent", "mean"),
         aggregate_mape_std_percent=("aggregate_mape_percent", "std"),
         aggregate_mape_worst_percent=("aggregate_mape_percent", "max"),
         wape_mean_percent=("wape_percent", "mean"),
-        company_mape_mean_percent=("company_mape_nonzero_percent", "mean"),
+        company_median_ape_mean_percent=("company_median_ape_percent", "mean"),
         bias_mean_percent=("bias_percent", "mean"),
         folds=("fold", "nunique"),
     ).sort_values(["flow", "aggregate_mape_mean_percent"])
@@ -752,6 +795,9 @@ def main() -> None:
         write_russian_reports(output, metrics, summary, windows, predictions_path)
     config = vars(args).copy()
     config["features"] = features
+    config["objective_version"] = MONTHLY_OBJECTIVE_VERSION
+    config["objective_name"] = MONTHLY_OBJECTIVE_NAME
+    config["target_diagnostics"] = target_total_diagnostics(target_matrix(monthly))
     (output / "run_config.json").write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
     print("\n=== СТАБИЛЬНОСТЬ ЗА {} ТЕСТОВЫХ МЕСЯЦЕВ ===".format(len(fold_specs)))
     if not args.technical_reports_only:

@@ -45,6 +45,31 @@ import numpy as np
 import torch
 from torch import nn
 
+try:
+    from experiments.monthly_objective import (
+        MONTHLY_OBJECTIVE_NAME,
+        MONTHLY_OBJECTIVE_VERSION,
+        baseline_from_feature_matrix,
+        fit_feature_normalizer,
+        fit_residual_scale,
+        monthly_regression_metrics,
+        normalize_features,
+        restore_residual_predictions,
+        scale_residual_targets,
+    )
+except ImportError:
+    from monthly_objective import (
+        MONTHLY_OBJECTIVE_NAME,
+        MONTHLY_OBJECTIVE_VERSION,
+        baseline_from_feature_matrix,
+        fit_feature_normalizer,
+        fit_residual_scale,
+        monthly_regression_metrics,
+        normalize_features,
+        restore_residual_predictions,
+        scale_residual_targets,
+    )
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -95,7 +120,10 @@ def build_model(input_width: int, layers: Sequence[int], activation: str, dropou
     for hidden in layers:
         modules.extend([nn.Linear(width, int(hidden)), kind(), nn.Dropout(dropout)])
         width = int(hidden)
-    modules.append(nn.Linear(width, 2))
+    output_layer = nn.Linear(width, 2)
+    nn.init.zeros_(output_layer.weight)
+    nn.init.zeros_(output_layer.bias)
+    modules.append(output_layer)
     return nn.Sequential(*modules)
 
 
@@ -115,37 +143,7 @@ def atomic_npz(path: Path, **arrays: np.ndarray) -> None:
 
 
 def metrics(actual: np.ndarray, predicted: np.ndarray, zero_floor: float) -> List[Dict[str, float]]:
-    rows: List[Dict[str, float]] = []
-    for index, flow in enumerate(("inflow_credit", "outflow_debit")):
-        truth = actual[:, index].astype(np.float64)
-        forecast = predicted[:, index].astype(np.float64)
-        nonzero = np.abs(truth) > zero_floor
-        total_truth = float(truth.sum())
-        total_forecast = float(forecast.sum())
-        aggregate_mape = abs(total_forecast - total_truth) / max(abs(total_truth), zero_floor)
-        wape = np.abs(forecast - truth).sum() / max(np.abs(truth).sum(), zero_floor)
-        company_mape = (
-            float(np.mean(np.abs(forecast[nonzero] - truth[nonzero]) / np.abs(truth[nonzero])))
-            if nonzero.any() else float("nan")
-        )
-        rows.append({
-            "flow": flow,
-            "aggregate_mape": float(aggregate_mape),
-            "aggregate_mape_percent": float(aggregate_mape * 100),
-            "company_mape_nonzero": company_mape,
-            "company_mape_nonzero_percent": float(company_mape * 100),
-            "wape": float(wape),
-            "wape_percent": float(wape * 100),
-            "mae": float(np.mean(np.abs(forecast - truth))),
-            "bias_percent": float(
-                (total_forecast - total_truth) / max(abs(total_truth), zero_floor) * 100
-            ),
-            "actual_total": total_truth,
-            "predicted_total": total_forecast,
-            "nonzero_companies": int(nonzero.sum()),
-            "companies": int(len(truth)),
-        })
-    return rows
+    return monthly_regression_metrics(actual, predicted, zero_floor)
 
 
 def gpu_memory(device: torch.device) -> str:
@@ -229,6 +227,8 @@ def main() -> None:
     ), flush=True)
 
     prepared = Path(args.prepared_dir)
+    manifest = json.loads((prepared / "manifest.json").read_text(encoding="utf-8"))
+    feature_names = [str(value) for value in manifest["features"]]
     X_all = np.load(str(prepared / "features.npy"), mmap_mode="r", allow_pickle=False)
     y_all = np.load(str(prepared / "targets.npy"), mmap_mode="r", allow_pickle=False)
     months = np.load(str(prepared / "months.npy"), mmap_mode="r", allow_pickle=False)
@@ -248,20 +248,26 @@ def main() -> None:
     X_valid_raw = np.asarray(X_all[valid_indices], dtype=np.float32)
     X_test_raw = np.asarray(X_all[test_indices], dtype=np.float32)
     actual_test = np.asarray(y_all[test_indices], dtype=np.float64)
-    feature_mean = X_train_raw.mean(axis=0, dtype=np.float64)
-    feature_scale = X_train_raw.std(axis=0, dtype=np.float64)
-    feature_scale = np.maximum(feature_scale, 1e-6)
-    X_train_np = ((X_train_raw - feature_mean) / feature_scale).astype(np.float32)
-    X_valid_np = ((X_valid_raw - feature_mean) / feature_scale).astype(np.float32)
-    X_test_np = ((X_test_raw - feature_mean) / feature_scale).astype(np.float32)
-    y_train_log = np.log1p(np.asarray(y_all[train_indices], dtype=np.float32))
-    y_valid_log = np.log1p(np.asarray(y_all[valid_indices], dtype=np.float32))
-    target_mean = y_train_log.mean(axis=0, dtype=np.float64).astype(np.float32)
-    target_scale = np.maximum(
-        y_train_log.std(axis=0, dtype=np.float64).astype(np.float32), 1e-3
+    baseline_train = baseline_from_feature_matrix(X_train_raw, feature_names)
+    baseline_valid = baseline_from_feature_matrix(X_valid_raw, feature_names)
+    baseline_test = baseline_from_feature_matrix(X_test_raw, feature_names)
+    feature_mean, feature_scale, active_features = fit_feature_normalizer(X_train_raw)
+    X_train_np = normalize_features(
+        X_train_raw, feature_mean, feature_scale, active_features
     )
-    y_train_np = ((y_train_log - target_mean) / target_scale).astype(np.float32)
-    y_valid_np = ((y_valid_log - target_mean) / target_scale).astype(np.float32)
+    X_valid_np = normalize_features(
+        X_valid_raw, feature_mean, feature_scale, active_features
+    )
+    X_test_np = normalize_features(
+        X_test_raw, feature_mean, feature_scale, active_features
+    )
+    train_targets = np.asarray(y_all[train_indices], dtype=np.float64)
+    valid_targets = np.asarray(y_all[valid_indices], dtype=np.float64)
+    train_residual = train_targets - baseline_train
+    valid_residual = valid_targets - baseline_valid
+    residual_scale = fit_residual_scale(train_residual)
+    y_train_np = scale_residual_targets(train_residual, residual_scale)
+    y_valid_np = scale_residual_targets(valid_residual, residual_scale)
     if not all(np.isfinite(item).all() for item in (
         X_train_np, X_valid_np, X_test_np, y_train_np, y_valid_np
     )):
@@ -282,11 +288,13 @@ def main() -> None:
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
     )
-    loss_function = nn.SmoothL1Loss()
+    loss_function = nn.MSELoss()
     use_amp = bool(args.amp and device.type == "cuda")
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
-    best_loss = float("inf")
-    best_state = None
+    model.eval()
+    with torch.no_grad(), torch.cuda.amp.autocast(enabled=use_amp):
+        best_loss = float(loss_function(model(x_valid), y_valid))
+    best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
     best_epoch = 0
     remaining = args.patience
     batch_size = min(args.batch_size, len(x_train))
@@ -302,6 +310,8 @@ def main() -> None:
             with torch.cuda.amp.autocast(enabled=use_amp):
                 loss = loss_function(model(x_train[indices]), y_train[indices])
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             scaler.step(optimizer)
             scaler.update()
         model.eval()
@@ -333,8 +343,9 @@ def main() -> None:
     model.eval()
     with torch.no_grad(), torch.cuda.amp.autocast(enabled=use_amp):
         prediction_scaled = model(x_test).float().cpu().numpy()
-    prediction_log = prediction_scaled * target_scale + target_mean
-    prediction = np.maximum(np.expm1(prediction_log), 0.0).astype(np.float64)
+    prediction = restore_residual_predictions(
+        baseline_test, prediction_scaled, residual_scale
+    ).astype(np.float64)
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     training_seconds = time.perf_counter() - started
@@ -344,6 +355,7 @@ def main() -> None:
             "fold": args.fold,
             "test_month": str(args.test_month),
             "model": args.model,
+            "architecture": " → ".join(str(value) for value in layers),
             "training_seconds": round(training_seconds, 3),
         })
 
@@ -367,6 +379,10 @@ def main() -> None:
         "device": args.device,
         "best_epoch": best_epoch,
         "training_seconds": round(training_seconds, 3),
+        "objective_version": MONTHLY_OBJECTIVE_VERSION,
+        "objective_name": MONTHLY_OBJECTIVE_NAME,
+        "residual_scale": residual_scale.astype(float).tolist(),
+        "active_features": int(active_features.sum()),
     })
     success_marker.write_text("OK\n", encoding="utf-8")
     print("SUCCESS | период {} | {:.1f} сек | {}".format(

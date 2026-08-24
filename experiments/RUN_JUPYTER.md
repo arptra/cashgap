@@ -120,37 +120,43 @@ print(pq.read_schema(INFLOW))
   --min-train-months 12 \
   --max-inns 1000 \
   --epochs 3 \
-  --batch-size 32768 \
-  --parallel \
+  --batch-size 4096 \
   --mlp2-device cuda:0 \
   --mlp3-device cuda:1
 ```
 
 ## 6. Полное базовое обучение и проверка на 10 месяцах
 
-Это основной первый запуск. В каждом из десяти fold модели обучаются только на
-прошлом, а затем проверяются на очередном будущем месяце. MLP из двух слоёв
-работает на `cuda:0`, MLP из трёх слоёв — на `cuda:1`; линейная регрессия,
-прогноз по среднему и gradient boosting работают на CPU.
+Это основной первый запуск. Используйте новый каталог: результаты старой версии
+с логарифмическим target несовместимы. Каждый месяц идёт в отдельном процессе,
+модели внутри месяца — по очереди; это устойчивый режим для EL8.
 
 ```python
-%run experiments/benchmark_monthly_cashflow.py \
+%run experiments/launch_training.py full-benchmark \
   --outflow "/data/outflow.parquet" \
   --inflow "/data/inflow.parquet" \
-  --output-dir "./artifacts/monthly_benchmark_base" \
+  --output-dir "./artifacts/monthly_benchmark_v2" \
   --models trailing_mean,linear_regression,gradient_boosting,torch_mlp_2_layers,torch_mlp_3_layers \
   --test-periods 10 \
   --min-train-months 12 \
   --epochs 100 \
-  --batch-size 32768 \
-  --parallel \
+  --batch-size 4096 \
+  --cpu-threads 8 \
   --mlp2-device cuda:0 \
-  --mlp3-device cuda:1
+  --mlp3-device cuda:1 \
+  --mlp2-layers 512,256 \
+  --mlp3-layers 1024,768,512,256
 ```
 
-Результаты сохраняются в `artifacts/monthly_benchmark_base`. Главные
+Не добавляйте `--parallel` в первый полный запуск. Если child получит `SIGSEGV`
+уже после полной записи, runner проверит CSV/Parquet и продолжит следующий месяц.
+Старые кэши, folds и `best_params.json` автоматически отклоняются по версии
+целевой функции.
+
+Результаты сохраняются в `artifacts/monthly_benchmark_v2`. Главные
 бизнес-файлы полностью на русском:
 
+- `00_проверка_расчета.md` — PASS-сверка рейтинга с исходными прогнозами; читайте её первой;
 - `бизнес_отчет.md` — основной отчёт: вывод, рейтинг, ошибки в рублях, худшие месяцы и риски;
 - `01_рейтинг_моделей.csv` — компактный рейтинг моделей;
 - `02_качество_по_месяцам.csv` — факт, прогноз, ошибка в рублях и процентах;
@@ -176,11 +182,12 @@ CSV записываются в UTF-8 с BOM, разделителем `;` и д
   --output-dir "./artifacts/torch_10_external"
 ```
 
-### Full-parallel профиль: 64 CPU, 500 ГБ RAM, две GPU по 40 ГБ
+### Full-parallel профиль: только после успешного устойчивого запуска
 
 Этот профиль использует все модели одновременно, выделяет CPU-моделям до 12
 потоков каждой и делает обе MLP достаточно широкими для полезной нагрузки GPU.
 Месячные признаки разделяются между моделями в RAM, а folds создаются по одному.
+На сервере, где уже наблюдался `SIGSEGV`, не используйте его для первого результата.
 
 ```python
 %run experiments/benchmark_monthly_cashflow.py \
@@ -206,16 +213,16 @@ CSV записываются в UTF-8 с BOM, разделителем `;` и д
 GPU нельзя гарантировать независимо от числа строк, но эти настройки увеличивают
 полезные матричные вычисления, не добавляя искусственный stress-нагрев.
 
-### Изолированный full-parallel режим при restart kernel
+### Изолированный устойчивый режим при restart kernel
 
 Если один Jupyter-процесс стабилен только на трёх folds, используйте отдельный
-runner. Каждый тестовый месяц выполняется в новом дочернем Python-процессе, но
-внутри месяца все пять моделей по-прежнему запускаются параллельно. После fold
+runner. Каждый тестовый месяц выполняется в новом дочернем Python-процессе.
+Внутри месяца модели запускаются по очереди. После fold
 операционная система полностью освобождает CUDA contexts, VRAM, native thread
 pools и RAM. Затем runner потоково объединяет результаты всех месяцев.
 
 ```python
-%run experiments/benchmark_monthly_isolated.py \
+%run experiments/launch_training.py full-benchmark \
   --outflow "/data/outflow.parquet" \
   --inflow "/data/inflow.parquet" \
   --output-dir "./artifacts/monthly_benchmark_isolated" \
@@ -226,14 +233,10 @@ pools и RAM. Затем runner потоково объединяет резул
   --batch-size 4096 \
   --boosting-iterations 250 \
   --cpu-threads 8 \
-  --parallel \
   --mlp2-device cuda:0 \
   --mlp3-device cuda:1 \
   --mlp2-layers 512,256 \
-  --mlp3-layers 768,512,256 \
-  --save-model torch_mlp_3_layers \
-  --forecast-months 12 \
-  --model-output-dir "./artifacts/monthly_benchmark_isolated/saved_model"
+  --mlp3-layers 1024,768,512,256
 ```
 
 Объединённые файлы имеют те же имена, что у обычного benchmark. Постоянный лог
@@ -283,8 +286,7 @@ subprocess.run([
 ### Стабильный режим при `RuntimeError: exit code -11`
 
 Код `-11` означает нативный `SIGSEGV`, а не Python exception. Если даже
-изолированный benchmark падает на 10 периодах, не используйте для этого запуска
-`benchmark_monthly_isolated.py`. Запускайте специальный Torch-only pipeline:
+нужна отдельная проверка только одной MLP, запускайте Torch-only pipeline:
 
 ```python
 %run experiments/launch_training.py benchmark \
@@ -299,7 +301,6 @@ subprocess.run([
   --layers 4096,2048 \
   --devices cuda:0,cuda:1 \
   --cpu-threads 8 \
-  --amp
 ```
 
 Ячейка завершится сразу, но обучение будет работать. Проверка статуса и
@@ -319,7 +320,7 @@ subprocess.run([
 
 Здесь нет флага `--parallel`. Периоды идут строго по одному: первый на
 `cuda:0`, второй на `cuda:1`, третий снова на `cuda:0` и так далее. Активная GPU
-получает широкую сеть `4096,2048`, большой batch и AMP/Tensor Cores. Вторая GPU
+получает широкую сеть `4096,2048` и большой batch. Вторая GPU
 в этот момент намеренно свободна — это плата за максимально устойчивый режим.
 
 Главное отличие от прежнего isolated runner: PyArrow/pandas готовят данные один
@@ -344,27 +345,28 @@ artifacts/torch_10_sequential/sequential_folds/fold_XX_YYYYMM/failure_diagnostic
 
 В `worker.log` каждые пять эпох выводятся загрузка GPU, VRAM, мощность и
 температура. Все итоговые русские отчёты записываются прямо в
-`artifacts/torch_10_sequential`. Начните чтение результатов с файла
-`бизнес_отчет.md`.
+`artifacts/torch_10_sequential`. Сначала откройте
+`00_проверка_расчета.md`, затем `бизнес_отчет.md`.
 
 ## 7. Посмотреть результаты базового обучения
 
-Итоговый рейтинг моделей:
+Итоговый бизнес-рейтинг моделей:
 
 ```python
 import pandas as pd
 
 summary = pd.read_csv(
-    "./artifacts/monthly_benchmark_base/monthly_stability_summary.csv"
+    "./artifacts/monthly_benchmark_v2/01_рейтинг_моделей.csv",
+    sep=";", decimal=",", encoding="utf-8-sig"
 )
-display(summary.sort_values(["flow", "aggregate_mape_mean_percent"]))
+display(summary)
 ```
 
 Метрики всех десяти месяцев:
 
 ```python
 fold_metrics = pd.read_csv(
-    "./artifacts/monthly_benchmark_base/monthly_fold_metrics.csv"
+    "./artifacts/monthly_benchmark_v2/monthly_fold_metrics.csv"
 )
 display(fold_metrics.head(30))
 ```
@@ -373,22 +375,20 @@ display(fold_metrics.head(30))
 
 ```python
 predictions = pd.read_parquet(
-    "./artifacts/monthly_benchmark_base/monthly_predictions.parquet"
+    "./artifacts/monthly_benchmark_v2/monthly_predictions.parquet"
 )
 display(predictions.sample(min(20, len(predictions))))
 ```
 
-Основной показатель — `aggregate_mape_mean_percent`: средняя процентная ошибка
-совокупных зачислений или списаний за месяц. Чем меньше, тем лучше.
-`aggregate_mape_std_percent` показывает стабильность, а
-`aggregate_mape_worst_percent` — ошибку в худшем тестовом месяце.
+В `01_рейтинг_моделей.csv` место 1 отдельно для зачислений и списаний означает
+победителя; главная колонка — `Средняя ошибка месячного итога, %`.
 
 Русский рейтинг в notebook:
 
 ```python
 summary_ru = pd.read_csv(
-    "./artifacts/monthly_benchmark_isolated/отчет_стабильность_моделей.csv",
-    sep=";",
+    "./artifacts/monthly_benchmark_v2/01_рейтинг_моделей.csv",
+    sep=";", decimal=",", encoding="utf-8-sig",
 )
 display(summary_ru)
 ```
@@ -396,10 +396,11 @@ display(summary_ru)
 ## 8. Автотюнинг MLP на двух GPU
 
 Используйте устойчивый dispatcher. Он не импортирует CUDA в Jupyter-процесс,
-один раз готовит NumPy-массивы и запускает каждый fold в новом чистом
-PyTorch-процессе. Одновременно работает ровно по одному trial на GPU.
-Если конкретная комбинация падает через OOM/SIGSEGV, падает только её trial,
-а весь автотюнинг продолжается.
+один раз готовит NumPy-массивы и до создания trials реально обучает по две эпохи
+на каждой GPU. Затем проверяет две GPU одновременно. Если совместный запуск даёт
+`SIGSEGV`, автоматически переходит на последовательные trials с чередованием GPU.
+После двух полностью упавших волн подбор останавливается, поэтому десятки
+одинаковых FAILED trials больше не создаются.
 
 Финальные 10 месяцев защищены от автотюнинга. Запуск:
 
@@ -407,8 +408,8 @@ PyTorch-процессе. Одновременно работает ровно �
 %run experiments/launch_training.py autotune \
   --outflow "/data/outflow.parquet" \
   --inflow "/data/inflow.parquet" \
-  --output-dir "./artifacts/cashflow_tuning_stable" \
-  --trials 30 \
+  --output-dir "./artifacts/cashflow_tuning_v2" \
+  --trials 6 \
   --devices cuda:0,cuda:1 \
   --tuning-periods 3 \
   --holdout-test-periods 10 \
@@ -417,15 +418,16 @@ PyTorch-процессе. Одновременно работает ровно �
   --cpu-threads 8 \
   --max-width 2048 \
   --max-layers 6 \
-  --worker-timeout-minutes 180 \
-  --amp
+  --worker-timeout-minutes 180
 ```
 
-Не добавляйте `--jobs`: число одновременных trials автоматически равно числу
-GPU в `--devices`. Лучшие параметры сохранятся в:
+Не добавляйте `--jobs` и сначала не добавляйте `--amp`. Старый каталог tuning
+использовать нельзя: его target и study относятся к ошибочной версии. Если шесть
+trials успешны, повторите ту же команду с тем же `--output-dir` и, например,
+`--trials 24`; это добавит ещё 24 варианта. Лучшие параметры сохранятся в:
 
 ```text
-artifacts/cashflow_tuning_stable/best_params.json
+artifacts/cashflow_tuning_v2/best_params.json
 ```
 
 Текущее состояние всегда записано в `study.sqlite3`, `отчет_автотюнинг.csv` и
@@ -437,32 +439,12 @@ artifacts/cashflow_tuning_stable/best_params.json
 
 ```python
 %run experiments/launch_training.py status \
-  --output-dir "./artifacts/cashflow_tuning_stable" \
+  --output-dir "./artifacts/cashflow_tuning_v2" \
   --lines 60
 ```
 
 Повторный запуск той же команды не перечитывает Parquet, продолжает study и
 добавляет ещё указанное в `--trials` количество trials.
-
-Для более долгого поиска достаточно увеличить число trials и epochs:
-
-```python
-%run experiments/launch_training.py autotune \
-  --outflow "/data/outflow.parquet" \
-  --inflow "/data/inflow.parquet" \
-  --output-dir "./artifacts/cashflow_tuning_stable_full" \
-  --trials 100 \
-  --devices cuda:0,cuda:1 \
-  --tuning-periods 3 \
-  --holdout-test-periods 10 \
-  --min-train-months 12 \
-  --epochs 120 \
-  --cpu-threads 8 \
-  --max-width 2048 \
-  --max-layers 6 \
-  --worker-timeout-minutes 180 \
-  --amp
-```
 
 Старая команда `autotune_cashflow.py --model mlp` тоже автоматически
 перенаправляется в этот устойчивый режим, но новую команду выше читать проще.
@@ -476,7 +458,7 @@ Gradient boosting из этого эксперимента обучается н
   --model gradient_boosting \
   --outflow "/data/outflow.parquet" \
   --inflow "/data/inflow.parquet" \
-  --output-dir "./artifacts/cashflow_tuning/gradient_boosting" \
+  --output-dir "./artifacts/cashflow_tuning_v2/gradient_boosting" \
   --trials 40 \
   --jobs 2 \
   --tuning-periods 3 \
@@ -487,39 +469,39 @@ Gradient boosting из этого эксперимента обучается н
 Лучшие параметры сохранятся в:
 
 ```text
-artifacts/cashflow_tuning/gradient_boosting/best_params.json
+artifacts/cashflow_tuning_v2/gradient_boosting/best_params.json
 ```
 
 ## 10. Финальное сравнение с подобранными настройками
 
-Tuned MLP запускается на `cuda:0`, обычная трёхслойная MLP — на `cuda:1`.
-Базовая двухслойная сеть здесь не запускается повторно: её результат уже есть в
-`monthly_benchmark_base`.
+Финальное сравнение снова выполняется в изолированных месячных процессах и на
+десяти защищённых периодах, которых автотюнинг не видел.
 
 ```python
-%run experiments/benchmark_monthly_cashflow.py \
+%run experiments/launch_training.py full-benchmark \
   --outflow "/data/outflow.parquet" \
   --inflow "/data/inflow.parquet" \
-  --output-dir "./artifacts/monthly_benchmark_tuned" \
+  --output-dir "./artifacts/monthly_benchmark_tuned_v2" \
   --models trailing_mean,linear_regression,gradient_boosting,torch_mlp_3_layers,torch_mlp_tuned \
   --test-periods 10 \
   --min-train-months 12 \
   --epochs 100 \
-  --batch-size 32768 \
-  --parallel \
+  --batch-size 4096 \
   --mlp2-device cuda:0 \
   --mlp3-device cuda:1 \
-  --mlp-params "./artifacts/cashflow_tuning_stable/best_params.json" \
-  --boosting-params "./artifacts/cashflow_tuning/gradient_boosting/best_params.json"
+  --mlp3-layers 1024,768,512,256 \
+  --mlp-params "./artifacts/cashflow_tuning_v2/best_params.json" \
+  --boosting-params "./artifacts/cashflow_tuning_v2/gradient_boosting/best_params.json"
 ```
 
 Посмотреть финальный рейтинг:
 
 ```python
 final_summary = pd.read_csv(
-    "./artifacts/monthly_benchmark_tuned/monthly_stability_summary.csv"
+    "./artifacts/monthly_benchmark_tuned_v2/01_рейтинг_моделей.csv",
+    sep=";", decimal=",", encoding="utf-8-sig"
 )
-display(final_summary.sort_values(["flow", "aggregate_mape_mean_percent"]))
+display(final_summary)
 ```
 
 ## 11. Дневной прогноз риска отрицательного чистого потока

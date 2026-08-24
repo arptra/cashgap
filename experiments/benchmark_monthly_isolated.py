@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run monthly folds in isolated processes and combine their artifacts.
 
-Each child process still starts all selected models in parallel. Process-level
+By default, each child runs the selected models one by one. Process-level
 isolation guarantees that CUDA contexts, native thread pools and allocator
 caches are released by the operating system after every test month.
 """
@@ -16,7 +16,7 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 
 if __name__ == "__main__" and os.environ.get("CASHGAP_EXTERNAL_DRIVER") != "1":
@@ -51,8 +51,10 @@ import pyarrow.parquet as pq
 
 try:
     from experiments.monthly_reports_ru import write_russian_reports
+    from experiments.monthly_objective import MONTHLY_OBJECTIVE_NAME, MONTHLY_OBJECTIVE_VERSION
 except ImportError:
     from monthly_reports_ru import write_russian_reports
+    from monthly_objective import MONTHLY_OBJECTIVE_NAME, MONTHLY_OBJECTIVE_VERSION
 
 
 DEFAULT_MODELS = ",".join([
@@ -140,7 +142,50 @@ def child_command(args: argparse.Namespace, fold_output: Path, offset: int) -> L
     return command
 
 
-def run_child(command: List[str], log_path: Path) -> None:
+def benchmark_artifacts_valid(output: Path) -> Tuple[bool, str]:
+    required = [
+        output / "monthly_fold_metrics.csv",
+        output / "monthly_fold_windows.csv",
+        output / "monthly_predictions.parquet",
+        output / "run_config.json",
+    ]
+    if any(not path.exists() for path in required):
+        return False, "не хватает обязательных файлов"
+    try:
+        metrics = pd.read_csv(required[0])
+        windows = pd.read_csv(required[1])
+        config = json.loads(required[3].read_text(encoding="utf-8"))
+        prediction_rows = pq.ParquetFile(required[2]).metadata.num_rows
+        if metrics.empty or windows.empty or prediction_rows < 1:
+            return False, "один из артефактов пуст"
+        if int(config.get("objective_version", -1)) < 2:
+            return False, "артефакт создан старой ошибочной целевой функцией"
+    except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
+        return False, str(error)
+    return True, "OK"
+
+
+def export_artifacts_valid(output: Path) -> Tuple[bool, str]:
+    required = [
+        output / "model_metadata.json",
+        output / "forecasts_api.parquet",
+    ]
+    if any(not path.exists() for path in required):
+        return False, "не хватает файлов модели/API"
+    try:
+        metadata = json.loads(required[0].read_text(encoding="utf-8"))
+        rows = pq.ParquetFile(required[1]).metadata.num_rows
+        if int(metadata.get("objective_version", -1)) < 2 or rows < 1:
+            return False, "пакет модели пуст или создан старой целевой функцией"
+    except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
+        return False, str(error)
+    return True, "OK"
+
+
+def run_child(
+    command: List[str], log_path: Path,
+    artifact_validator: Optional[Callable[[], Tuple[bool, str]]] = None,
+) -> None:
     print("Команда дочернего процесса: {}".format(
         " ".join(shlex.quote(part) for part in command)
     ), flush=True)
@@ -158,6 +203,14 @@ def run_child(command: List[str], log_path: Path) -> None:
             log_file.write(line)
         return_code = process.wait()
     if return_code != 0:
+        valid, reason = artifact_validator() if artifact_validator else (False, "нет проверки")
+        if valid:
+            print(
+                "ВНИМАНИЕ: дочерний процесс завершился с кодом {}, но все артефакты "
+                "полностью записаны и проверены — результат принят.".format(return_code),
+                flush=True,
+            )
+            return
         hint = ""
         if return_code == -11:
             hint = (
@@ -165,8 +218,9 @@ def run_child(command: List[str], log_path: Path) -> None:
                 "experiments/benchmark_torch_sequential.py: он не смешивает PyArrow и CUDA."
             )
         raise RuntimeError(
-            "Дочерний процесс периода завершился с кодом {}. Постоянный лог: {}.{}".format(
-                return_code, log_path.resolve(), hint
+            "Дочерний процесс периода завершился с кодом {}. Артефакты: {}. "
+            "Постоянный лог: {}.{}".format(
+                return_code, reason, log_path.resolve(), hint
             )
         )
 
@@ -227,11 +281,12 @@ def append_prediction_batches(
 
 def stability_summary(metrics: pd.DataFrame) -> pd.DataFrame:
     return metrics.groupby(["model", "flow"], as_index=False).agg(
+        architecture=("architecture", "first"),
         aggregate_mape_mean_percent=("aggregate_mape_percent", "mean"),
         aggregate_mape_std_percent=("aggregate_mape_percent", "std"),
         aggregate_mape_worst_percent=("aggregate_mape_percent", "max"),
         wape_mean_percent=("wape_percent", "mean"),
-        company_mape_mean_percent=("company_mape_nonzero_percent", "mean"),
+        company_median_ape_mean_percent=("company_median_ape_percent", "mean"),
         bias_mean_percent=("bias_percent", "mean"),
         folds=("fold", "nunique"),
     ).sort_values(["flow", "aggregate_mape_mean_percent"])
@@ -271,7 +326,10 @@ def main() -> None:
             print("\n=== ИЗОЛИРОВАННЫЙ ПЕРИОД {}/{} | смещение {} ===".format(
                 fold_number, args.test_periods, offset
             ), flush=True)
-            run_child(child_command(args, fold_output, offset), log_path)
+            run_child(
+                child_command(args, fold_output, offset), log_path,
+                artifact_validator=lambda path=fold_output: benchmark_artifacts_valid(path),
+            )
 
             metrics = pd.read_csv(fold_output / "monthly_fold_metrics.csv")
             windows = pd.read_csv(fold_output / "monthly_fold_windows.csv")
@@ -302,6 +360,8 @@ def main() -> None:
     write_russian_reports(output, metrics, summary, windows, final_predictions)
     config: Dict[str, object] = vars(args).copy()
     config["execution"] = "one isolated child process per test month"
+    config["objective_version"] = MONTHLY_OBJECTIVE_VERSION
+    config["objective_name"] = MONTHLY_OBJECTIVE_NAME
     (output / "run_config.json").write_text(
         json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -316,7 +376,10 @@ def main() -> None:
         print("\n=== ФИНАЛЬНОЕ ОБУЧЕНИЕ И СОХРАНЕНИЕ МОДЕЛИ {} ===".format(
             args.save_model
         ))
-        run_child(export_command(args, model_output), output / "model_export.log")
+        run_child(
+            export_command(args, model_output), output / "model_export.log",
+            artifact_validator=lambda: export_artifacts_valid(model_output),
+        )
         print("Модель и таблица прогнозов для API сохранены: {}".format(
             model_output.resolve()
         ))

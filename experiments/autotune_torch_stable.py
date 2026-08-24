@@ -17,6 +17,7 @@ import os
 import shlex
 import subprocess
 import sys
+import time
 from argparse import Namespace
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
@@ -69,6 +70,10 @@ try:
         validate_fold_artifacts,
         worker_command,
     )
+    from experiments.monthly_objective import (
+        MONTHLY_OBJECTIVE_NAME,
+        MONTHLY_OBJECTIVE_VERSION,
+    )
 except ImportError:
     from benchmark_torch_sequential import (
         failure_report,
@@ -79,6 +84,7 @@ except ImportError:
         validate_fold_artifacts,
         worker_command,
     )
+    from monthly_objective import MONTHLY_OBJECTIVE_NAME, MONTHLY_OBJECTIVE_VERSION
 
 
 def parse_args() -> argparse.Namespace:
@@ -103,6 +109,10 @@ def parse_args() -> argparse.Namespace:
         help="Остановить зависший fold и продолжить подбор (по умолчанию 180 минут)",
     )
     parser.add_argument("--amp", action="store_true")
+    parser.add_argument(
+        "--sequential-trials", action="store_true",
+        help="Не запускать два CUDA-worker одновременно; GPU всё равно чередуются",
+    )
     parser.add_argument("--rebuild-prepared", action="store_true")
     return parser.parse_args()
 
@@ -204,6 +214,121 @@ def trial_worker_args(
         amp=base.amp,
         score_only=True,
     )
+
+
+def _preflight_one_worker(
+    base: argparse.Namespace,
+    prepared: Path,
+    fold: Dict[str, int],
+    device: str,
+    output: Path,
+    label: str,
+) -> Tuple[bool, str]:
+    params: Dict[str, object] = {
+        "layers": [128, 64],
+        "batch_size": 4096,
+        "learning_rate": 1e-3,
+        "weight_decay": 1e-4,
+        "dropout": 0.10,
+        "activation": "relu",
+        "patience": 2,
+    }
+    worker_args = trial_worker_args(base, params, -1)
+    worker_args.epochs = 2
+    worker_args.seed = base.seed
+    fold_output = output / label / device.replace(":", "_")
+    fold_output.mkdir(parents=True, exist_ok=True)
+    command = worker_command(worker_args, prepared, fold_output, fold, device)
+    return_code = run_worker(
+        command, fold_output / "worker.log", base.cpu_threads,
+        timeout_seconds=min(base.worker_timeout_minutes * 60, 20 * 60),
+    )
+    valid, reason = validate_fold_artifacts(fold_output, require_predictions=False)
+    if return_code == 0 and valid:
+        return True, "OK"
+    if return_code != 0 and valid:
+        return True, "{} после полной записи".format(signal_description(return_code))
+    report = failure_report(fold_output, return_code, reason)
+    return False, "{} | {}".format(signal_description(return_code), report.resolve())
+
+
+def training_preflight(
+    base: argparse.Namespace,
+    prepared: Path,
+    fold: Dict[str, int],
+    devices: Sequence[str],
+    output: Path,
+) -> bool:
+    """Prove that a real worker trains before Optuna is allowed to create trials."""
+    root = output / "_training_preflight" / time.strftime("%Y%m%d_%H%M%S")
+    root.mkdir(parents=True, exist_ok=True)
+    print("\n=== PREFLIGHT: 2 ЭПОХИ РЕАЛЬНОГО ОБУЧЕНИЯ НА КАЖДОЙ GPU ===", flush=True)
+
+    def sequential_check(label: str) -> Tuple[bool, List[str]]:
+        failures: List[str] = []
+        for device in devices:
+            ok, detail = _preflight_one_worker(
+                base, prepared, fold, device, root, "{}_{}".format(label, device.replace(":", "_"))
+            )
+            print("Preflight {} | {} | {}".format(device, "OK" if ok else "FAILED", detail), flush=True)
+            if not ok:
+                failures.append("{}: {}".format(device, detail))
+        return not failures, failures
+
+    sequential_ok, sequential_failures = sequential_check("sequential")
+    if not sequential_ok and base.amp:
+        print(
+            "AMP дал сбой в реальном preflight. Автоматически повторяю без AMP.",
+            flush=True,
+        )
+        base.amp = False
+        sequential_ok, sequential_failures = sequential_check("sequential_no_amp")
+    if not sequential_ok:
+        raise RuntimeError(
+            "Реальный Torch-worker не проходит даже безопасный последовательный preflight; "
+            "Optuna не запущена и новые failed trials не созданы. {}".format(
+                " | ".join(sequential_failures)
+            )
+        )
+
+    if base.sequential_trials or len(devices) < 2:
+        print("Autotune будет выполнять trials по одному, чередуя GPU.", flush=True)
+        return False
+
+    print("\nПроверка двух одновременных CUDA-worker...", flush=True)
+    concurrent_results: List[Tuple[str, bool, str]] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(devices)) as executor:
+        futures = {
+            executor.submit(
+                _preflight_one_worker,
+                base,
+                prepared,
+                fold,
+                device,
+                root,
+                "concurrent_{}".format(device.replace(":", "_")),
+            ): device
+            for device in devices
+        }
+        for future in concurrent.futures.as_completed(futures):
+            device = futures[future]
+            try:
+                ok, detail = future.result()
+            except Exception as error:
+                ok, detail = False, repr(error)
+            concurrent_results.append((device, ok, detail))
+            print("Concurrent preflight {} | {} | {}".format(
+                device, "OK" if ok else "FAILED", detail
+            ), flush=True)
+    if all(ok for _, ok, _ in concurrent_results):
+        print("Два одновременных CUDA-worker проверены: параллельный режим разрешён.", flush=True)
+        return True
+    print(
+        "Одновременный CUDA-запуск нестабилен. Trials будут идти по одному с "
+        "чередованием GPU; это предотвращает повторение SIGSEGV.",
+        flush=True,
+    )
+    return False
 
 
 def atomic_json(path: Path, payload: object) -> None:
@@ -356,6 +481,8 @@ def write_reports(
         "",
         "Каждый trial оценивается по среднему совокупному MAPE зачислений и списаний "
         "на нескольких временных folds. Чем меньше objective, тем лучше.",
+        "Модель учит поправку в рублях к прогнозу по среднему; логарифмический target "
+        "из старой версии больше не используется.",
         "",
         "> Этот результат выбирает настройки модели, но ещё не является финальной "
         "оценкой для бизнеса. Качество выбранных настроек нужно отдельно проверить "
@@ -368,6 +495,8 @@ def write_reports(
         best_params["layers"] = list(best.user_attrs.get("layers", []))
         payload = {
             "model": "mlp",
+            "objective_version": MONTHLY_OBJECTIVE_VERSION,
+            "objective_name": MONTHLY_OBJECTIVE_NAME,
             "objective": "mean aggregate monthly MAPE for credit and debit",
             "best_value": float(best.value),
             "best_value_percent": float(best.value * 100),
@@ -411,7 +540,8 @@ def write_reports(
         "",
         "CUDA-worker каждого fold является отдельным процессом. Если конкретная "
         "комбинация слоёв или batch приводит к OOM/SIGSEGV, Optuna получает состояние "
-        "FAIL, сохраняет диагностику и переходит к следующей комбинации.",
+        "FAIL и сохраняет диагностику. Две полностью неудачные волны подряд аварийно "
+        "останавливают подбор, чтобы не создавать десятки одинаковых FAILED trials.",
     ])
     report = "\n".join(lines) + "\n"
     (output / "отчет_автотюнинг.md").write_text(report, encoding="utf-8")
@@ -464,6 +594,8 @@ def main() -> None:
         "protected_months": list(protected),
         "epochs": args.epochs,
         "mape_zero_floor": args.mape_zero_floor,
+        "objective_version": MONTHLY_OBJECTIVE_VERSION,
+        "objective_name": MONTHLY_OBJECTIVE_NAME,
     }
     previous_key = study.user_attrs.get("study_key")
     if previous_key is not None and previous_key != study_key:
@@ -474,14 +606,30 @@ def main() -> None:
     if previous_key is None:
         study.set_user_attr("study_key", study_key)
 
+    parallel_safe = training_preflight(args, prepared, folds[0], devices, output)
+    simultaneous = len(devices) if parallel_safe else 1
+    print(
+        "Фактический режим Optuna: одновременно {} trial(s); GPU {}.".format(
+            simultaneous,
+            "работают параллельно" if parallel_safe else "чередуются после проверки SIGSEGV",
+        ),
+        flush=True,
+    )
+
     remaining = args.trials
+    device_cursor = 0
+    failed_waves = 0
     while remaining > 0:
-        wave_size = min(len(devices), remaining)
+        wave_size = min(simultaneous, remaining)
         wave = []
         for index in range(wave_size):
             trial = study.ask()
             params = suggest_params(trial, args)
-            wave.append((trial, params, devices[index]))
+            device = devices[(device_cursor + index) % len(devices)]
+            wave.append((trial, params, device))
+        device_cursor = (device_cursor + wave_size) % len(devices)
+        wave_successes = 0
+        wave_failures: List[str] = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=wave_size) as executor:
             futures = {
                 executor.submit(
@@ -495,17 +643,24 @@ def main() -> None:
                     result = future.result()
                 except Exception as error:
                     study.tell(trial, state=TrialState.FAIL)
+                    wave_failures.append("trial {}: {!r}".format(trial.number, error))
                     print("Trial {} аварийно завершился: {!r}; подбор продолжается.".format(
                         trial.number, error
                     ), flush=True)
                     continue
                 if result["status"] == "complete":
                     study.tell(trial, float(result["objective"]))
+                    wave_successes += 1
                     print("\n>>> Trial {} готов | objective {:.3f}% | {}".format(
                         trial.number, float(result["objective_percent"]), result["device"]
                     ), flush=True)
                 else:
                     study.tell(trial, state=TrialState.FAIL)
+                    wave_failures.append(
+                        "trial {}: {}".format(
+                            trial.number, result.get("signal", result.get("reason"))
+                        )
+                    )
                     print("\n>>> Trial {} FAILED: {} | подбор продолжается".format(
                         trial.number, result.get("signal", result.get("reason"))
                     ), flush=True)
@@ -514,6 +669,17 @@ def main() -> None:
         print("Состояние study сохранено: успешных {} / всего {}.".format(
             len(completed_trials(study)), len(study.trials)
         ), flush=True)
+        if wave_successes == 0:
+            failed_waves += 1
+        else:
+            failed_waves = 0
+        if failed_waves >= 2:
+            raise RuntimeError(
+                "Две последовательные волны autotune полностью упали. Подбор остановлен, "
+                "чтобы не создавать десятки одинаковых FAILED trials. Последние причины: {}".format(
+                    " | ".join(wave_failures)
+                )
+            )
 
     complete = completed_trials(study)
     if complete:

@@ -47,7 +47,7 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingRegressor
-from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import Ridge
 from sklearn.multioutput import MultiOutputRegressor
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
@@ -58,10 +58,19 @@ try:
         MODEL_NAMES,
         _activation,
         build_monthly_dataset,
-        inverse_log_predictions,
         load_tuned_params,
         parse_layers,
         target_matrix,
+    )
+    from experiments.monthly_objective import (
+        MONTHLY_OBJECTIVE_NAME,
+        MONTHLY_OBJECTIVE_VERSION,
+        baseline_from_feature_matrix,
+        fit_feature_normalizer,
+        fit_residual_scale,
+        normalize_features,
+        restore_residual_predictions,
+        scale_residual_targets,
     )
     from experiments.monthly_reports_ru import model_name_ru
     from experiments.train_cashflow_proxy import build_observed_daily
@@ -70,10 +79,19 @@ except ImportError:
         MODEL_NAMES,
         _activation,
         build_monthly_dataset,
-        inverse_log_predictions,
         load_tuned_params,
         parse_layers,
         target_matrix,
+    )
+    from monthly_objective import (
+        MONTHLY_OBJECTIVE_NAME,
+        MONTHLY_OBJECTIVE_VERSION,
+        baseline_from_feature_matrix,
+        fit_feature_normalizer,
+        fit_residual_scale,
+        normalize_features,
+        restore_residual_predictions,
+        scale_residual_targets,
     )
     from monthly_reports_ru import model_name_ru
     from train_cashflow_proxy import build_observed_daily
@@ -134,9 +152,10 @@ def _fit_sklearn(
     output: Path,
 ) -> Tuple[Callable[[pd.DataFrame], np.ndarray], str]:
     X = frame[list(features)].fillna(0.0).astype(np.float32, copy=False)
-    y = np.log1p(target_matrix(frame))
+    baseline = baseline_from_feature_matrix(X.to_numpy(), list(X.columns))
+    y = target_matrix(frame) - baseline
     if model_id == "linear_regression":
-        estimator = make_pipeline(StandardScaler(), LinearRegression(n_jobs=1))
+        estimator = make_pipeline(StandardScaler(), Ridge(alpha=1000.0))
     else:
         options = {
             "max_iter": args.boosting_iterations,
@@ -158,7 +177,10 @@ def _fit_sklearn(
     joblib.dump(estimator, model_file, compress=3)
 
     def predict(X_future: pd.DataFrame) -> np.ndarray:
-        return inverse_log_predictions(estimator.predict(X_future))
+        future_baseline = baseline_from_feature_matrix(
+            X_future.to_numpy(), list(X_future.columns)
+        )
+        return np.maximum(future_baseline + estimator.predict(X_future), 0.0)
 
     return predict, model_file.name
 
@@ -209,15 +231,20 @@ def _fit_torch(
         raise ValueError("Недостаточно месяцев для train/validation финальной MLP.")
     X_train = train[list(features)].fillna(0.0).astype(np.float32, copy=False)
     X_valid = valid[list(features)].fillna(0.0).astype(np.float32, copy=False)
-    scaler = StandardScaler().fit(X_train)
-    x_train_np = scaler.transform(X_train).astype(np.float32, copy=False)
-    x_valid_np = scaler.transform(X_valid).astype(np.float32, copy=False)
-    y_train_np = np.log1p(target_matrix(train)).astype(np.float32, copy=False)
-    y_valid_np = np.log1p(target_matrix(valid)).astype(np.float32, copy=False)
-    y_mean = y_train_np.mean(axis=0)
-    y_scale = np.maximum(y_train_np.std(axis=0), 1e-3)
-    y_train_np = (y_train_np - y_mean) / y_scale
-    y_valid_np = (y_valid_np - y_mean) / y_scale
+    feature_mean, feature_scale, active_features = fit_feature_normalizer(X_train.to_numpy())
+    x_train_np = normalize_features(
+        X_train.to_numpy(), feature_mean, feature_scale, active_features
+    )
+    x_valid_np = normalize_features(
+        X_valid.to_numpy(), feature_mean, feature_scale, active_features
+    )
+    baseline_train = baseline_from_feature_matrix(X_train.to_numpy(), list(X_train.columns))
+    baseline_valid = baseline_from_feature_matrix(X_valid.to_numpy(), list(X_valid.columns))
+    train_residual = target_matrix(train) - baseline_train
+    valid_residual = target_matrix(valid) - baseline_valid
+    residual_scale = fit_residual_scale(train_residual)
+    y_train_np = scale_residual_targets(train_residual, residual_scale)
+    y_valid_np = scale_residual_targets(valid_residual, residual_scale)
 
     torch.manual_seed(args.seed)
     x_train = torch.as_tensor(x_train_np, device=device)
@@ -234,16 +261,21 @@ def _fit_torch(
             nn.Dropout(float(options["dropout"])),
         ])
         width = int(hidden)
-    modules.append(nn.Linear(width, 2))
+    output_layer = nn.Linear(width, 2)
+    nn.init.zeros_(output_layer.weight)
+    nn.init.zeros_(output_layer.bias)
+    modules.append(output_layer)
     model = nn.Sequential(*modules).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=float(options["learning_rate"]),
         weight_decay=float(options["weight_decay"]),
     )
-    loss_function = nn.SmoothL1Loss()
-    best_loss = float("inf")
-    best_state = None
+    loss_function = nn.MSELoss()
+    model.eval()
+    with torch.no_grad():
+        best_loss = float(loss_function(model(x_valid), y_valid))
+    best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
     patience = int(options["patience"])
     remaining = patience
     print(
@@ -262,6 +294,7 @@ def _fit_torch(
             optimizer.zero_grad()
             loss = loss_function(model(x_train[indices]), y_train[indices])
             loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
         model.eval()
         with torch.no_grad():
@@ -284,16 +317,18 @@ def _fit_torch(
     model.load_state_dict(best_state)
     model.eval()
     checkpoint = {
-        "format_version": 1,
+        "format_version": 2,
         "model_id": model_id,
+        "objective_version": MONTHLY_OBJECTIVE_VERSION,
+        "objective_name": MONTHLY_OBJECTIVE_NAME,
         "features": list(features),
         "layers": layers,
         "activation": str(options["activation"]),
         "dropout": float(options["dropout"]),
-        "scaler_mean": scaler.mean_.astype(float).tolist(),
-        "scaler_scale": scaler.scale_.astype(float).tolist(),
-        "target_mean": y_mean.astype(float).tolist(),
-        "target_scale": y_scale.astype(float).tolist(),
+        "feature_mean": feature_mean.astype(float).tolist(),
+        "feature_scale": feature_scale.astype(float).tolist(),
+        "active_features": active_features.astype(bool).tolist(),
+        "residual_scale": residual_scale.astype(float).tolist(),
         "state_dict": best_state,
     }
     model_file = output / "model.pt"
@@ -303,7 +338,12 @@ def _fit_torch(
     ))
 
     def predict(X_future: pd.DataFrame) -> np.ndarray:
-        values = scaler.transform(X_future).astype(np.float32, copy=False)
+        future_baseline = baseline_from_feature_matrix(
+            X_future.to_numpy(), list(X_future.columns)
+        )
+        values = normalize_features(
+            X_future.to_numpy(), feature_mean, feature_scale, active_features
+        )
         parts = []
         model.eval()
         with torch.no_grad():
@@ -311,7 +351,7 @@ def _fit_torch(
                 tensor = torch.as_tensor(values[start:start + batch_size], device=device)
                 parts.append(model(tensor).cpu().numpy())
         scaled = np.concatenate(parts, axis=0)
-        return inverse_log_predictions(scaled * y_scale + y_mean)
+        return restore_residual_predictions(future_baseline, scaled, residual_scale)
 
     return predict, model_file.name, device_name, layers
 
@@ -509,6 +549,8 @@ def main() -> None:
         model_file.write_text(json.dumps({
             "model": model_id,
             "rule": "mean of previous 3 months with previous month fallback",
+            "objective_version": MONTHLY_OBJECTIVE_VERSION,
+            "objective_name": MONTHLY_OBJECTIVE_NAME,
         }, ensure_ascii=False, indent=2), encoding="utf-8")
 
         def predictor(X_future: pd.DataFrame) -> np.ndarray:
@@ -530,10 +572,17 @@ def main() -> None:
     recent_history.to_parquet(output / "monthly_history.parquet", index=False)
     _write_forecast_reports(forecasts, output)
     last_month = pd.Timestamp(monthly["month"].max())
+    model_display_name = model_name_ru(model_id)
+    if layers:
+        model_display_name = "{} ({})".format(
+            model_display_name, " → ".join(str(value) for value in layers)
+        )
     metadata = {
-        "format_version": 1,
+        "format_version": 2,
         "model_id": model_id,
-        "model_name_ru": model_name_ru(model_id),
+        "objective_version": MONTHLY_OBJECTIVE_VERSION,
+        "objective_name": MONTHLY_OBJECTIVE_NAME,
+        "model_name_ru": model_display_name,
         "model_file": model_filename,
         "features": list(features),
         "feature_count": len(features),
@@ -556,12 +605,13 @@ def main() -> None:
     )
     russian_metadata = {
         "код_модели": model_id,
-        "название_модели": model_name_ru(model_id),
+        "название_модели": model_display_name,
         "файл_модели": model_filename,
         "последний_полный_месяц_данных": metadata["last_complete_month"],
         "первый_месяц_прогноза": metadata["first_forecast_month"],
         "месяцев_прогноза": args.forecast_months,
         "количество_инн": metadata["forecast_inns"],
+        "целевая_функция": MONTHLY_OBJECTIVE_NAME,
         "примечание": metadata["forecast_note_ru"],
         "ограничение": metadata["cash_gap_note_ru"],
     }

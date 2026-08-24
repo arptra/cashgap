@@ -88,6 +88,10 @@ try:
         rolling_month_folds,
         target_matrix,
     )
+    from experiments.monthly_objective import (
+        MONTHLY_OBJECTIVE_NAME,
+        MONTHLY_OBJECTIVE_VERSION,
+    )
 except ImportError:
     from train_cashflow_proxy import build_observed_daily
     from benchmark_monthly_cashflow import (
@@ -99,6 +103,7 @@ except ImportError:
         rolling_month_folds,
         target_matrix,
     )
+    from monthly_objective import MONTHLY_OBJECTIVE_NAME, MONTHLY_OBJECTIVE_VERSION
 
 
 def parse_args() -> argparse.Namespace:
@@ -301,6 +306,8 @@ def main() -> None:
         best_params["layers"] = list(study.best_trial.user_attrs["layers"])
     payload = {
         "model": args.model,
+        "objective_version": MONTHLY_OBJECTIVE_VERSION,
+        "objective_name": MONTHLY_OBJECTIVE_NAME,
         "objective": "mean aggregate monthly MAPE for credit and debit",
         "best_value": float(study.best_value),
         "best_value_percent": float(study.best_value * 100),

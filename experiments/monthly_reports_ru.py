@@ -4,8 +4,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
+import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -15,8 +16,8 @@ MODEL_NAMES_RU: Dict[str, str] = {
     "trailing_mean": "Прогноз по среднему",
     "linear_regression": "Линейная регрессия",
     "gradient_boosting": "Градиентный бустинг",
-    "torch_mlp_2_layers": "Полносвязная сеть — 2 слоя",
-    "torch_mlp_3_layers": "Полносвязная сеть — 3 слоя",
+    "torch_mlp_2_layers": "Полносвязная сеть — вариант A",
+    "torch_mlp_3_layers": "Полносвязная сеть — вариант B",
     "torch_mlp_tuned": "Полносвязная сеть — настроенная",
 }
 
@@ -28,6 +29,14 @@ FLOW_NAMES_RU = {
 
 def model_name_ru(model_id: str) -> str:
     return MODEL_NAMES_RU.get(str(model_id), str(model_id))
+
+
+def model_display_ru(row: pd.Series) -> str:
+    name = model_name_ru(str(row.get("model", "")))
+    architecture = row.get("architecture")
+    if architecture is None or pd.isna(architecture) or not str(architecture).strip():
+        return name
+    return "{} ({})".format(name, architecture)
 
 
 def _month_values(values: pd.Series) -> pd.Series:
@@ -78,14 +87,16 @@ def russian_metrics(metrics: pd.DataFrame) -> pd.DataFrame:
         "Номер тестового периода": result["fold"],
         "Тестовый месяц": result["test_month"],
         "Денежный поток": result["flow"].map(FLOW_NAMES_RU).fillna(result["flow"]),
-        "Модель": result["model"].map(model_name_ru),
+        "Модель": [model_display_ru(row) for _, row in result.iterrows()],
+        "Архитектура/метод": result.get(
+            "architecture", pd.Series(["Не записана"] * len(result), index=result.index)
+        ),
         "Фактическая сумма, руб.": result["actual_total"],
         "Прогнозная сумма, руб.": result["predicted_total"],
         "Отклонение прогноза, руб.": result["predicted_total"] - result["actual_total"],
         "Абсолютная ошибка, руб.": (result["predicted_total"] - result["actual_total"]).abs(),
         "Ошибка месячного итога, %": result["aggregate_mape_percent"],
         "Ошибка прогноза отдельных компаний, %": result["wape_percent"],
-        "Средняя процентная ошибка одного ИНН, %": result["company_mape_nonzero_percent"],
         "Завышение (+) или занижение (-), %": result["bias_percent"],
         "Компаний в тесте": result["companies"],
         "Компаний с ненулевым фактом": result["nonzero_companies"],
@@ -103,12 +114,14 @@ def russian_summary(summary: pd.DataFrame) -> pd.DataFrame:
     business = pd.DataFrame({
         "Место": result["rank"],
         "Денежный поток": result["flow"].map(FLOW_NAMES_RU).fillna(result["flow"]),
-        "Модель": result["model"].map(model_name_ru),
+        "Модель": [model_display_ru(row) for _, row in result.iterrows()],
+        "Архитектура/метод": result.get(
+            "architecture", pd.Series(["Не записана"] * len(result), index=result.index)
+        ),
         "Средняя ошибка месячного итога, %": result["aggregate_mape_mean_percent"],
         "Насколько ошибка скачет по месяцам, п.п.": result["aggregate_mape_std_percent"],
         "Ошибка в самом плохом месяце, %": result["aggregate_mape_worst_percent"],
         "Ошибка прогноза отдельных компаний, %": result["wape_mean_percent"],
-        "Средняя процентная ошибка одного ИНН, %": result["company_mape_mean_percent"],
         "Завышение (+) или занижение (-), %": result["bias_mean_percent"],
         "Количество тестовых месяцев": result["folds"],
     })
@@ -208,9 +221,139 @@ def _write_russian_predictions(source: Path, destination: Path) -> None:
             writer.close()
 
 
+def _validate_prediction_totals(
+    metrics: pd.DataFrame, predictions_path: Path,
+) -> Dict[str, object]:
+    """Recompute every reported total from durable predictions before reporting."""
+    required_prediction_columns = {
+        "fold", "model", "actual_inflow", "predicted_inflow",
+        "actual_outflow", "predicted_outflow",
+    }
+    parquet = pq.ParquetFile(predictions_path)
+    missing = required_prediction_columns - set(parquet.schema.names)
+    if missing:
+        raise RuntimeError("Проверка отчёта: в predictions нет колонок {}.".format(sorted(missing)))
+
+    totals: Dict[Tuple[int, str], Dict[str, float]] = {}
+    prediction_rows = 0
+    negative_predictions = 0
+    for batch in parquet.iter_batches(
+        batch_size=100_000, columns=sorted(required_prediction_columns)
+    ):
+        frame = batch.to_pandas()
+        prediction_rows += len(frame)
+        negative_predictions += int(
+            frame[["predicted_inflow", "predicted_outflow"]].lt(-1e-6).sum().sum()
+        )
+        if not np_isfinite_frame(frame, [
+            "actual_inflow", "predicted_inflow", "actual_outflow", "predicted_outflow"
+        ]):
+            raise RuntimeError("Проверка отчёта: predictions содержит NaN или infinity.")
+        grouped = frame.groupby(["fold", "model"], as_index=False).agg(
+            actual_inflow=("actual_inflow", "sum"),
+            predicted_inflow=("predicted_inflow", "sum"),
+            actual_outflow=("actual_outflow", "sum"),
+            predicted_outflow=("predicted_outflow", "sum"),
+        )
+        for _, row in grouped.iterrows():
+            key = (int(row["fold"]), str(row["model"]))
+            accumulator = totals.setdefault(key, {
+                "actual_inflow": 0.0,
+                "predicted_inflow": 0.0,
+                "actual_outflow": 0.0,
+                "predicted_outflow": 0.0,
+            })
+            for column in accumulator:
+                accumulator[column] += float(row[column])
+
+    if prediction_rows < 1:
+        raise RuntimeError("Проверка отчёта: predictions пуст.")
+    if negative_predictions:
+        raise RuntimeError(
+            "Проверка отчёта: найдено {} отрицательных прогнозов зачислений/списаний.".format(
+                negative_predictions
+            )
+        )
+
+    errors: List[str] = []
+    flow_columns = {
+        "inflow_credit": ("actual_inflow", "predicted_inflow"),
+        "outflow_debit": ("actual_outflow", "predicted_outflow"),
+    }
+    duplicate_keys = metrics.duplicated(["fold", "model", "flow"]).sum()
+    if duplicate_keys:
+        errors.append("дубли строк метрик: {}".format(int(duplicate_keys)))
+    for _, row in metrics.iterrows():
+        key = (int(row["fold"]), str(row["model"]))
+        values = totals.get(key)
+        columns = flow_columns.get(str(row["flow"]))
+        if values is None or columns is None:
+            errors.append("нет predictions для {} / {}".format(key, row["flow"]))
+            continue
+        for metric_column, prediction_column in zip(
+            ("actual_total", "predicted_total"), columns
+        ):
+            expected = float(row[metric_column])
+            calculated = float(values[prediction_column])
+            tolerance = max(0.01, abs(expected) * 1e-8)
+            if abs(expected - calculated) > tolerance:
+                errors.append(
+                    "{} {} {}: CSV={} Parquet={}".format(
+                        key, row["flow"], metric_column, expected, calculated
+                    )
+                )
+    if errors:
+        raise RuntimeError(
+            "Проверка отчёта не пройдена; рейтинг не создан. {}".format(" | ".join(errors[:10]))
+        )
+    return {
+        "prediction_rows": prediction_rows,
+        "metric_rows": int(len(metrics)),
+        "folds": int(metrics["fold"].nunique()),
+        "models": int(metrics["model"].nunique()),
+        "checked_totals": int(len(metrics) * 2),
+    }
+
+
+def np_isfinite_frame(frame: pd.DataFrame, columns: List[str]) -> bool:
+    return bool(np.isfinite(frame[columns].to_numpy(dtype=np.float64)).all())
+
+
+def _write_validation_report(output: Path, result: Dict[str, object]) -> None:
+    folds = int(result["folds"])
+    readiness = (
+        "Количество тестовых месяцев достаточно для оценки стабильности."
+        if folds >= 10 else
+        "Проверка расчётов пройдена, но для оценки стабильности нужно минимум 10 месяцев."
+    )
+    text = "\n".join([
+        "# Проверка корректности расчёта",
+        "",
+        "**Статус: ПРОЙДЕНА.**",
+        "",
+        "- Строк детальных прогнозов: **{:,}**.".format(int(result["prediction_rows"])),
+        "- Строк метрик: **{:,}**.".format(int(result["metric_rows"])),
+        "- Тестовых месяцев: **{}**.".format(folds),
+        "- Моделей: **{}**.".format(result["models"]),
+        "- Фактические и прогнозные суммы CSV заново сверены с Parquet для каждого "
+        "месяца, потока и модели.",
+        "- NaN, infinity и отрицательных прогнозов зачислений/списаний не найдено.",
+        "",
+        readiness,
+        "",
+    ])
+    (output / "00_проверка_расчета.md").write_text(text, encoding="utf-8")
+
+
 def _business_conclusion(summary: pd.DataFrame, periods: int) -> str:
+    status = (
+        "ОЦЕНКА СТАБИЛЬНОСТИ ВЫПОЛНЕНА"
+        if periods >= 10
+        else "ТОЛЬКО ДИАГНОСТИКА: НУЖНО МИНИМУМ 10 ТЕСТОВЫХ МЕСЯЦЕВ"
+    )
     lines = [
         "БИЗНЕС-ВЫВОД ПО СТАБИЛЬНОСТИ МОДЕЛЕЙ",
+        "Статус: {}".format(status),
         "Тестовых периодов: {}".format(periods),
         "",
         "MAPE совокупного потока показывает ошибку общей суммы по всем компаниям за месяц.",
@@ -226,7 +369,10 @@ def _business_conclusion(summary: pd.DataFrame, periods: int) -> str:
         best = candidates.iloc[0]
         lines.extend([
             "{}:".format(flow_name),
-            "  Лучшая модель: {} ({})".format(model_name_ru(best["model"]), best["model"]),
+            "  Лидер {}теста: {} ({})".format(
+                "предварительного " if periods < 10 else "",
+                model_display_ru(best), best["model"],
+            ),
             "  Средняя ошибка месячного итога: {:.2f}%".format(
                 best["aggregate_mape_mean_percent"]
             ),
@@ -272,11 +418,16 @@ def _markdown_summary(
     train_start = pd.to_datetime(windows["train_start"]).min() if not windows.empty else None
     train_end = pd.to_datetime(windows["train_end"]).max() if not windows.empty else None
 
+    company_summary_column = (
+        "company_median_ape_mean_percent"
+        if "company_median_ape_mean_percent" in summary.columns
+        else "company_mape_mean_percent"
+    )
     overall = summary.groupby("model", as_index=False).agg(
         mean_mape=("aggregate_mape_mean_percent", "mean"),
         worst_mape=("aggregate_mape_worst_percent", "max"),
         mean_wape=("wape_mean_percent", "mean"),
-        mean_company_mape=("company_mape_mean_percent", "mean"),
+        mean_company_mape=(company_summary_column, "mean"),
     ).sort_values("mean_mape")
     overall_winner = overall.iloc[0] if not overall.empty else None
 
@@ -345,7 +496,7 @@ def _markdown_summary(
         best = candidates.iloc[0]
         best_rows.append([
             flow_name,
-            model_name_ru(best["model"]),
+            model_display_ru(best),
             _number(best["aggregate_mape_mean_percent"]) + "%",
             _number(best["aggregate_mape_std_percent"]) + "%",
             _number(best["aggregate_mape_worst_percent"]) + "%",
@@ -364,19 +515,19 @@ def _markdown_summary(
     ordered = summary.sort_values(["flow", "aggregate_mape_mean_percent"])
     for _, row in ordered.iterrows():
         comparison_rows.append([
-            model_name_ru(row["model"]),
+            model_display_ru(row),
             FLOW_NAMES_RU.get(str(row["flow"]), str(row["flow"])),
             _number(row["aggregate_mape_mean_percent"]) + "%",
             _number(row["aggregate_mape_std_percent"]) + "%",
             _number(row["aggregate_mape_worst_percent"]) + "%",
             _number(row["wape_mean_percent"]) + "%",
-            _number(row["company_mape_mean_percent"]) + "%",
+            _number(row[company_summary_column]) + "%",
             _number(row["bias_mean_percent"], sign=True) + "%",
         ])
     lines.extend(_markdown_table(
         [
             "Модель", "Поток", "Ошибка итога", "Скачки ошибки", "Худший месяц",
-            "Ошибка по компаниям", "Ошибка одного ИНН", "Завышение/занижение",
+            "Ошибка по компаниям", "Медианная ошибка ИНН", "Завышение/занижение",
         ],
         comparison_rows,
     ))
@@ -394,8 +545,8 @@ def _markdown_summary(
         "показывает риск плохого месяца, который среднее значение может скрыть.",
         "- **WAPE** — сумма абсолютных ошибок по отдельным ИНН, делённая на общую "
         "фактическую сумму. Ошибки разных компаний здесь не компенсируют друг друга.",
-        "- **Ошибка одного ИНН** — средняя процентная ошибка компаний, у которых факт не "
-        "равен нулю. Показатель чувствителен к небольшим суммам.",
+        "- **Медианная ошибка ИНН** — процентная ошибка типичного ИНН с ненулевым "
+        "фактом. Медиана не взрывается из-за нескольких клиентов с очень маленькими суммами.",
         "- **Смещение** — систематическое завышение или занижение. Плюс означает, "
         "что модель в среднем завышает поток; минус — занижает; около нуля лучше.",
         "",
@@ -410,7 +561,7 @@ def _markdown_summary(
         "1. Для планирования общей ликвидности сначала сравните **ошибку итога**, "
         "**худший месяц** и **смещение**.",
         "2. Для поклиентских решений обязательно смотрите **ошибку по компаниям** "
-        "и **ошибку одного ИНН**.",
+        "и **медианную ошибку ИНН**.",
         "3. Сравнивайте ML-модели с `Прогнозом по среднему`: сложная модель имеет "
         "смысл только если стабильно лучше простого baseline.",
         "4. Универсальной границы «хорошей точности» нет. Допустимый процент ошибки "
@@ -452,6 +603,7 @@ def _business_markdown(
     metric_values = _format_month_columns(metrics)
     window_values = _format_month_columns(windows)
     periods = int(window_values["fold"].nunique()) if not window_values.empty else 0
+    enough_periods = periods >= 10
     test_months = sorted(metric_values["test_month"].dropna().astype(str).unique())
     models_count = int(summary["model"].nunique()) if not summary.empty else 0
 
@@ -466,7 +618,7 @@ def _business_markdown(
             continue
         winner = candidates.iloc[0]
         winner_id = str(winner["model"])
-        winner_name = model_name_ru(winner_id)
+        winner_name = model_display_ru(winner)
         winner_metrics = metric_values[
             metric_values["flow"].eq(flow_id) & metric_values["model"].eq(winner_id)
         ].sort_values("test_month")
@@ -526,11 +678,13 @@ def _business_markdown(
                 "с утверждённым бизнес-допуском."
             ).format(improvement_text)
         executive_lines.extend([
-            "- **{}:** рекомендуемая по тесту модель — **{}**. В среднем модель "
+            "- **{}:** {} теста — **{}**. В среднем модель "
             "промахнулась в месячном итоге на **{}%**, в самом плохом месяце — "
             "на **{}%** ({}), среднее абсолютное "
             "денежное отклонение **{}**. {}".format(
                 flow_name,
+                "рекомендуемая модель по результатам" if enough_periods
+                else "лидер предварительного",
                 winner_name,
                 _number_ru(winner_mape),
                 _number_ru(winner["aggregate_mape_worst_percent"]),
@@ -555,6 +709,16 @@ def _business_markdown(
 
     lines = [
         "# Бизнес-отчёт по качеству прогноза денежных потоков",
+        "",
+        "## Статус проверки",
+        "",
+        (
+            "**ПРОВЕРКА СТАБИЛЬНОСТИ ВЫПОЛНЕНА:** использовано не менее 10 "
+            "последовательных тестовых месяцев."
+            if enough_periods else
+            "**ТОЛЬКО ДИАГНОСТИКА — НЕ ДЛЯ ВНЕДРЕНИЯ:** проверено {} из минимально "
+            "необходимых 10 тестовых месяцев. Места моделей предварительные."
+        ).format(periods),
         "",
         "## Резюме для принятия решения",
         "",
@@ -593,7 +757,9 @@ def _business_markdown(
         "- Прогнозируемые показатели: общая сумма зачислений и общая сумма списаний "
         "по каждому ИНН за календарный месяц.",
         "",
-        "## Рекомендуемые модели",
+        "## {}".format(
+            "Рекомендуемые модели" if enough_periods else "Предварительные лидеры"
+        ),
         "",
     ])
     lines.extend(_markdown_table(
@@ -615,7 +781,7 @@ def _business_markdown(
         for place, (_, row) in enumerate(candidates.iterrows(), start=1):
             ranking_rows.append([
                 str(place),
-                model_name_ru(row["model"]),
+                model_display_ru(row),
                 _number_ru(row["aggregate_mape_mean_percent"]) + "%",
                 _number_ru(row["aggregate_mape_std_percent"]) + " п.п.",
                 _number_ru(row["aggregate_mape_worst_percent"]) + "%",
@@ -675,6 +841,8 @@ def _business_markdown(
         "",
         "## Файлы для работы",
         "",
+        "- `00_проверка_расчета.md` — автоматическая сверка итогов CSV "
+        "с суммами исходных прогнозов Parquet.",
         "- `01_рейтинг_моделей.csv` — компактная таблица для выбора модели.",
         "- `02_качество_по_месяцам.csv` — факт, прогноз и ошибка каждого месяца.",
         "- `03_окна_тестирования.csv` — периоды обучения, валидации и теста.",
@@ -695,6 +863,8 @@ def write_russian_reports(
 ) -> None:
     """Write human-facing Russian artifacts while keeping technical files compatible."""
     output.mkdir(parents=True, exist_ok=True)
+    validation = _validate_prediction_totals(metrics, predictions_path)
+    _write_validation_report(output, validation)
     ranking = russian_summary(summary)
     monthly_quality = russian_metrics(metrics)
     test_windows = russian_windows(windows)

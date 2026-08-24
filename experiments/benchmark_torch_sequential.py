@@ -66,14 +66,24 @@ import pyarrow.parquet as pq
 try:
     from experiments.benchmark_monthly_cashflow import build_monthly_dataset, target_matrix
     from experiments.monthly_reports_ru import write_russian_reports
+    from experiments.monthly_objective import (
+        MONTHLY_OBJECTIVE_NAME,
+        MONTHLY_OBJECTIVE_VERSION,
+        target_total_diagnostics,
+    )
     from experiments.train_cashflow_proxy import build_observed_daily
 except ImportError:
     from benchmark_monthly_cashflow import build_monthly_dataset, target_matrix
     from monthly_reports_ru import write_russian_reports
+    from monthly_objective import (
+        MONTHLY_OBJECTIVE_NAME,
+        MONTHLY_OBJECTIVE_VERSION,
+        target_total_diagnostics,
+    )
     from train_cashflow_proxy import build_observed_daily
 
 
-PREPARED_FORMAT_VERSION = 1
+PREPARED_FORMAT_VERSION = 2
 MODEL_CHOICES = ("torch_mlp_2_layers", "torch_mlp_3_layers")
 
 
@@ -204,6 +214,9 @@ def prepare_numpy_data(args: argparse.Namespace, prepared: Path) -> Dict[str, ob
         "features": list(features),
         "months": [int(value) for value in sorted(np.unique(months))],
         "inns": int(monthly["inn"].nunique()),
+        "objective_version": MONTHLY_OBJECTIVE_VERSION,
+        "objective_name": MONTHLY_OBJECTIVE_NAME,
+        "target_diagnostics": target_total_diagnostics(targets),
     }
     temporary = prepared / "manifest.json.inprogress"
     temporary.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -345,6 +358,8 @@ def validate_fold_artifacts(
                     return False, "массивы predictions пустые или разной длины"
         if len(metrics) != 2 or int(window["test_rows"]) < 1:
             return False, "metrics/window неполные"
+        if int(window.get("objective_version", -1)) != MONTHLY_OBJECTIVE_VERSION:
+            return False, "артефакт создан старой целевой функцией и должен быть пересчитан"
     except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
         return False, str(error)
     return True, "OK"
@@ -427,15 +442,19 @@ def failure_report(fold_output: Path, return_code: int, validation_error: str) -
 
 
 def stability_summary(metrics: pd.DataFrame) -> pd.DataFrame:
-    return metrics.groupby(["model", "flow"], as_index=False).agg(
-        aggregate_mape_mean_percent=("aggregate_mape_percent", "mean"),
-        aggregate_mape_std_percent=("aggregate_mape_percent", "std"),
-        aggregate_mape_worst_percent=("aggregate_mape_percent", "max"),
-        wape_mean_percent=("wape_percent", "mean"),
-        company_mape_mean_percent=("company_mape_nonzero_percent", "mean"),
-        bias_mean_percent=("bias_percent", "mean"),
-        folds=("fold", "nunique"),
-    ).sort_values(["flow", "aggregate_mape_mean_percent"])
+    aggregations = {
+        "architecture": ("architecture", "first"),
+        "aggregate_mape_mean_percent": ("aggregate_mape_percent", "mean"),
+        "aggregate_mape_std_percent": ("aggregate_mape_percent", "std"),
+        "aggregate_mape_worst_percent": ("aggregate_mape_percent", "max"),
+        "wape_mean_percent": ("wape_percent", "mean"),
+        "company_median_ape_mean_percent": ("company_median_ape_percent", "mean"),
+        "bias_mean_percent": ("bias_percent", "mean"),
+        "folds": ("fold", "nunique"),
+    }
+    return metrics.groupby(["model", "flow"], as_index=False).agg(**aggregations).sort_values(
+        ["flow", "aggregate_mape_mean_percent"]
+    )
 
 
 def merge_artifacts(
@@ -556,6 +575,8 @@ def main() -> None:
     merge_artifacts(output, fold_outputs, folds, args.model)
     config = vars(args).copy()
     config["execution"] = "strictly sequential pure NumPy/PyTorch workers"
+    config["objective_version"] = MONTHLY_OBJECTIVE_VERSION
+    config["objective_name"] = MONTHLY_OBJECTIVE_NAME
     (output / "run_config.json").write_text(
         json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8"
     )
