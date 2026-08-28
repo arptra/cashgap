@@ -250,6 +250,8 @@ pools и RAM. Затем runner потоково объединяет резул
 и записывается в файл:
 
 - для MLP: `saved_model/model.pt`;
+- автономный runtime MLP: `saved_model/monthly_model_runtime.py`;
+- контракт входов и контрольный тест: `runtime_contract.json`, `runtime_self_test.npz`;
 - для линейной регрессии и бустинга: `saved_model/model.joblib`;
 - метаданные и описание: `model_metadata.json`, `описание_модели.json`;
 - прогнозы, которые читает API: `forecasts_api.parquet`;
@@ -282,6 +284,35 @@ subprocess.run([
     "--forecast-months", "12",
 ], check=True)
 ```
+
+Проверить MLP после переноса на другую ВМ без API:
+
+```bash
+python saved_model/monthly_model_runtime.py \
+  --model saved_model/model.pt \
+  --self-test saved_model/runtime_self_test.npz \
+  --describe
+```
+
+Встраивание в чужой Python-процесс:
+
+```python
+from monthly_model_runtime import MonthlyCashflowRuntime
+
+model = MonthlyCashflowRuntime("model.pt", device="cpu", cpu_threads=8)
+
+# history: NumPy матрица (N, 12, 6), месяцы от старого к новому.
+prediction = model.predict_history(
+    history,
+    history_months=months_since_first_observation,
+    forecast_month=month_numbers_1_to_12,
+    batch_size=65536,
+)
+# prediction[:, 0] — зачисления, prediction[:, 1] — списания, рубли.
+```
+
+Модель загружается один раз на процесс. Для высокой нагрузки нельзя
+вызывать `torch.load` на каждый запрос: запросы нужно объединять в batch.
 
 ### Стабильный режим при `RuntimeError: exit code -11`
 

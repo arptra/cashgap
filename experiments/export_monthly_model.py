@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Обучить финальную месячную модель и сохранить пакет для API.
+"""Обучить финальную месячную модель и сохранить пакет для инференса.
 
 Пакет содержит checkpoint модели, метаданные, последние 12 месяцев истории и
 предрассчитанные прогнозы. Первый будущий месяц является прямым прогнозом,
@@ -14,6 +14,7 @@ import json
 import math
 import random
 import shlex
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -352,6 +353,105 @@ def _fit_torch(
                 parts.append(model(tensor).cpu().numpy())
         scaled = np.concatenate(parts, axis=0)
         return restore_residual_predictions(future_baseline, scaled, residual_scale)
+
+    # A deployable model must include an executable runtime contract, not only
+    # opaque weights. The deterministic sample proves that another VM restores
+    # normalization, baseline correction and output units exactly.
+    sample = X_valid.iloc[:min(32, len(X_valid))]
+    sample_raw = sample.to_numpy(dtype=np.float32, copy=True)
+    sample_expected = predict(sample)
+    _, serving_history, serving_counts, _ = _serving_history(frame)
+    history_rows = min(32, len(serving_history))
+    serving_history = serving_history[:history_rows]
+    serving_counts = serving_counts[:history_rows]
+    future_period = pd.Timestamp(frame["month"].max()) + pd.offsets.MonthBegin(1)
+    history_features = _future_features(
+        serving_history, serving_counts, future_period, features
+    )
+    history_expected = predict(history_features)
+    self_test_path = output / "runtime_self_test.npz"
+    np.savez_compressed(
+        self_test_path,
+        raw_features=sample_raw,
+        expected_predictions=sample_expected,
+        monthly_history=serving_history,
+        history_months=serving_counts,
+        forecast_month=np.full(history_rows, future_period.month, dtype=np.int16),
+        expected_history_predictions=history_expected,
+    )
+    try:
+        from experiments.monthly_model_runtime import MonthlyCashflowRuntime
+    except ImportError:
+        from monthly_model_runtime import MonthlyCashflowRuntime
+    runtime_check = MonthlyCashflowRuntime(str(model_file), device="cpu")
+    runtime_check.run_self_test(str(self_test_path))
+
+    runtime_source = Path(__file__).with_name("monthly_model_runtime.py")
+    shutil.copy2(runtime_source, output / runtime_source.name)
+    (output / "runtime_contract.json").write_text(
+        json.dumps({
+            "runtime_format_version": 1,
+            "checkpoint": model_file.name,
+            "inputs": {
+                "engineered_features": {
+                    "shape": ["batch", len(features)],
+                    "dtype": "float32_or_float64",
+                    "ordered_features": list(features),
+                },
+                "monthly_history": {
+                    "shape": ["batch", 12, len(SOURCE_COLUMNS)],
+                    "oldest_month_first": True,
+                    "ordered_values": list(SOURCE_COLUMNS),
+                    "additional_inputs": ["history_months", "forecast_month_1_to_12"],
+                },
+            },
+            "output": {
+                "shape": ["batch", 2],
+                "dtype": "float64",
+                "ordered_values": ["predicted_inflow", "predicted_outflow"],
+                "unit": "rubles_per_calendar_month",
+            },
+            "self_test": self_test_path.name,
+        }, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (output / "requirements_runtime.txt").write_text(
+        "numpy==1.24.4\ntorch==2.3.1\n", encoding="utf-8"
+    )
+    (output / "README_MODEL_RUNTIME.md").write_text(
+        """# Запуск месячной MLP без API
+
+Пакет принимает не ИНН и не отдельную транзакцию. Для прогноза нужны либо
+готовые признаки, либо последние 12 календарных месяцев истории компании.
+Контракт входов записан в `runtime_contract.json`.
+
+Проверка после переноса на ВМ:
+
+```bash
+python monthly_model_runtime.py --model model.pt --self-test runtime_self_test.npz --describe
+```
+
+Пакетный запуск для массива NumPy формы `(N, F)`:
+
+```bash
+python monthly_model_runtime.py --model model.pt --input-npy features.npy --output-npy predictions.npy --batch-size 65536
+```
+
+В Python загрузите `MonthlyCashflowRuntime` один раз на процесс и повторно
+вызывайте `predict_matrix` для готовых признаков либо `predict_history` для
+истории формы `(N, 12, 6)`. В истории месяцы идут от старого к новому, а шесть
+значений имеют порядок: `target_inflow`, `target_outflow`, `target_net_flow`,
+`active_inflow_days`, `active_outflow_days`, `negative_days`.
+
+Выход имеет два столбца в рублях:
+`predicted_inflow`, `predicted_outflow`. Для высокой нагрузки объединяйте
+запросы в batch; не загружайте checkpoint заново на каждый запрос.
+""",
+        encoding="utf-8",
+    )
+    print("Runtime модели и self-test проверены: {}".format(
+        (output / "monthly_model_runtime.py").resolve()
+    ))
 
     return predict, model_file.name, device_name, layers
 

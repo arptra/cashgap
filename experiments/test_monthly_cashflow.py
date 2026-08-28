@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import torch
+from torch import nn
 
 try:
     from experiments.benchmark_monthly_cashflow import build_monthly_dataset, predict_linear
+    from experiments.monthly_model_runtime import MonthlyCashflowRuntime
     from experiments.monthly_objective import (
         MONTHLY_OBJECTIVE_VERSION,
         baseline_from_feature_matrix,
@@ -20,6 +23,7 @@ try:
     )
 except ImportError:
     from benchmark_monthly_cashflow import build_monthly_dataset, predict_linear
+    from monthly_model_runtime import MonthlyCashflowRuntime
     from monthly_objective import (
         MONTHLY_OBJECTIVE_VERSION,
         baseline_from_feature_matrix,
@@ -87,6 +91,51 @@ def test_linear_model_accepts_an_all_constant_early_fold() -> None:
     })
     prediction = predict_linear(features, train, features.iloc[:2], jobs=1)
     np.testing.assert_allclose(prediction, np.zeros((2, 2)))
+
+
+def test_standalone_runtime_restores_network_and_ruble_baseline(tmp_path) -> None:
+    features = ["target_inflow_mean_3", "target_outflow_mean_3", "history_months"]
+    model = nn.Sequential(
+        nn.Linear(3, 4), nn.ReLU(), nn.Dropout(0.1), nn.Linear(4, 2)
+    )
+    for parameter in model.parameters():
+        nn.init.zeros_(parameter)
+    checkpoint = {
+        "format_version": 2,
+        "model_id": "torch_mlp_2_layers",
+        "objective_version": 2,
+        "objective_name": "test",
+        "features": features,
+        "layers": [4],
+        "activation": "relu",
+        "dropout": 0.1,
+        "feature_mean": [0.0, 0.0, 0.0],
+        "feature_scale": [1.0, 1.0, 1.0],
+        "active_features": [True, True, False],
+        "residual_scale": [100.0, 200.0],
+        "state_dict": model.state_dict(),
+    }
+    model_path = tmp_path / "model.pt"
+    torch.save(checkpoint, model_path)
+    runtime = MonthlyCashflowRuntime(str(model_path), device="cpu", cpu_threads=1)
+    raw = np.asarray([[120.0, 80.0, 9_000_000.0], [75.0, 95.0, 1.0]])
+    prediction = runtime.predict_matrix(raw, batch_size=1)
+    np.testing.assert_allclose(prediction, raw[:, :2])
+    assert runtime.predict_one(dict(zip(features, raw[0]))) == {
+        "predicted_inflow": 120.0,
+        "predicted_outflow": 80.0,
+    }
+    history = np.zeros((1, 12, 6), dtype=np.float64)
+    history[0, -3:, 0] = [100.0, 120.0, 140.0]
+    history[0, -3:, 1] = [50.0, 60.0, 70.0]
+    history[0, :, 2] = history[0, :, 0] - history[0, :, 1]
+    history_prediction = runtime.predict_history(history, [12], [7])
+    np.testing.assert_allclose(history_prediction, [[120.0, 60.0]])
+    self_test_path = tmp_path / "runtime_self_test.npz"
+    np.savez_compressed(
+        self_test_path, raw_features=raw, expected_predictions=prediction
+    )
+    assert runtime.run_self_test(str(self_test_path))["status"] == "OK"
 
 
 def test_monthly_grid_keeps_dormant_company_without_future_survivorship() -> None:
