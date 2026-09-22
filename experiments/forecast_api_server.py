@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import argparse
 from bisect import bisect_left
+from calendar import monthrange
+from datetime import date, timedelta
+from decimal import Decimal, ROUND_HALF_UP
 import importlib.util
 import json
 import math
@@ -57,6 +60,20 @@ def normalize_period(value: str) -> str:
 class ForecastRequest(BaseModel):
     inn: str = Field(..., description="ИНН компании")
     period: str = Field(..., description="Месяц прогноза в формате YYYY-MM")
+
+
+def allocated_cents(amount: float, day: date) -> int:
+    """Calendar-stable allocation: a full month sums exactly to rounded kopecks."""
+    cents = int((Decimal(str(amount)) * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    base, remainder = divmod(cents, monthrange(day.year, day.month)[1])
+    return base + int(day.day <= remainder)
+
+
+def allocation_window(start: date):
+    try:
+        return [start + timedelta(days=offset) for offset in range(14)]
+    except OverflowError as error:
+        raise ValueError("Дата выходит за поддерживаемый диапазон календаря.") from error
 
 
 class ForecastStore:
@@ -156,8 +173,67 @@ class ForecastStore:
             ),
         }
 
+    def daily_dates(self, inn: str, period: str):
+        monthly = self.forecast(inn, period)
+        first = date.fromisoformat(monthly["период"] + "-01")
+        periods = set(self.frame.xs(inn.strip(), level="inn").index)
+        available = []
+        for day_number in range(1, monthrange(first.year, first.month)[1] + 1):
+            start = first.replace(day=day_number)
+            try:
+                window = allocation_window(start)
+            except ValueError:
+                continue
+            if all(day.isoformat()[:7] in periods for day in window):
+                available.append(start.isoformat())
+        return {"inn": inn.strip(), "period": monthly["период"], "dates": available,
+                "horizon_days": 14, "date_source": "calendar_of_saved_monthly_forecasts"}
 
-def create_app(store: ForecastStore, api_key: Optional[str] = None) -> FastAPI:
+    def daily_allocation(self, inn: str, start_date: str):
+        try:
+            start = date.fromisoformat(start_date)
+            if start.isoformat() != start_date:
+                raise ValueError()
+        except ValueError as error:
+            raise ValueError("Начальная дата должна иметь формат YYYY-MM-DD.") from error
+        window = allocation_window(start)
+        months = {}
+        for day in window:
+            period = day.isoformat()[:7]
+            if period not in months:
+                # Missing months are an error, never a zero or a repeated forecast.
+                months[period] = self.forecast(inn, period)
+        rows = []
+        total_inflow = total_outflow = 0
+        for day in window:
+            period = day.isoformat()[:7]
+            monthly = months[period]
+            inflow = allocated_cents(monthly["прогноз_зачислений"], day)
+            outflow = allocated_cents(monthly["прогноз_списаний"], day)
+            total_inflow += inflow
+            total_outflow += outflow
+            rows.append({"date": day.isoformat(), "source_period": period,
+                         "inflow": inflow / 100, "outflow": outflow / 100,
+                         "net_flow": (inflow - outflow) / 100,
+                         "cumulative_net_flow": (total_inflow - total_outflow) / 100})
+        return {
+            "inn": inn.strip(), "start_date": start.isoformat(), "end_date": window[-1].isoformat(),
+            "horizon_days": 14, "method": "uniform_calendar", "is_daily_model": False,
+            "rows": rows,
+            "totals": {"inflow": total_inflow / 100, "outflow": total_outflow / 100,
+                       "net_flow": (total_inflow - total_outflow) / 100},
+            "source_months": list(months.values()),
+            "explanation": (
+                "Равномерное распределение месячного прогноза, не дневная модель. "
+                "Сумма каждого месяца делится на число его календарных дней, включая выходные. "
+                "Остаток округления по 1 копейке добавляется к первым дням месяца. "
+                "14 дней включают выбранную начальную дату. Расписание реальных платежей неизвестно."
+            ),
+        }
+
+
+def create_app(store: ForecastStore, api_key: Optional[str] = None,
+               daily_allocation: bool = False) -> FastAPI:
     app = FastAPI(
         title="API прогноза денежных потоков",
         description=(
@@ -201,6 +277,7 @@ def create_app(store: ForecastStore, api_key: Optional[str] = None) -> FastAPI:
             "example_inn": store.inns[0],
             "source": "forecasts_api.parquet",
             "mode": "saved_monthly_forecasts",
+            "daily_allocation_enabled": daily_allocation,
         }
 
     @app.get("/ui/clients", summary="Поиск ИНН по началу номера")
@@ -230,6 +307,31 @@ def create_app(store: ForecastStore, api_key: Optional[str] = None) -> FastAPI:
             return store.client_timeline(inn)
         except LookupError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
+
+    if daily_allocation:
+        @app.get("/ui/daily-dates", summary="Даты начала полного 14-дневного распределения")
+        def ui_daily_dates(inn: str = Query(..., min_length=1, max_length=64),
+                           period: str = Query(..., min_length=6, max_length=10),
+                           x_api_key: Optional[str] = Header(default=None)):
+            authorize(x_api_key)
+            try:
+                return store.daily_dates(inn, period)
+            except ValueError as error:
+                raise HTTPException(status_code=422, detail=str(error)) from error
+            except LookupError as error:
+                raise HTTPException(status_code=404, detail=str(error)) from error
+
+        @app.get("/ui/daily-allocation", summary="Распределить месячные суммы на 14 календарных дней")
+        def ui_daily_allocation(inn: str = Query(..., min_length=1, max_length=64),
+                                start_date: str = Query(..., min_length=10, max_length=10),
+                                x_api_key: Optional[str] = Header(default=None)):
+            authorize(x_api_key)
+            try:
+                return store.daily_allocation(inn, start_date)
+            except ValueError as error:
+                raise HTTPException(status_code=422, detail=str(error)) from error
+            except LookupError as error:
+                raise HTTPException(status_code=404, detail=str(error)) from error
 
     @app.get("/health", summary="Проверить сервер")
     def health(x_api_key: Optional[str] = Header(default=None)) -> Dict[str, object]:
@@ -277,6 +379,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-dir", required=True, help="Каталог saved_model")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--daily-allocation", action="store_true",
+                        help="Включить в UI равномерное распределение месячных сумм на 14 дней (не дневная модель)")
     parser.add_argument(
         "--api-key", default=None,
         help="Если задан, клиенты должны передавать заголовок X-API-Key",
@@ -287,7 +391,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     store = ForecastStore(Path(args.model_dir))
-    app = create_app(store, args.api_key)
+    app = create_app(store, args.api_key, daily_allocation=args.daily_allocation)
     print("\n=== API ПРОГНОЗА ДЕНЕЖНЫХ ПОТОКОВ ===")
     print("Модель: {}".format(store.metadata.get("model_name_ru", store.metadata.get("model_id"))))
     print("ИНН: {:,} | периоды: {} — {}".format(
@@ -295,6 +399,8 @@ def main() -> None:
     ))
     print("Swagger: http://{}:{}/docs".format(args.host, args.port))
     print("Бизнес-интерфейс: http://{}:{}/".format(args.host, args.port))
+    if args.daily_allocation:
+        print("Режим на 14 дней ВКЛЮЧЁН: равномерное распределение месячных сумм, не дневная модель.")
     if args.host == "0.0.0.0" and not args.api_key:
         print("ВНИМАНИЕ: сервер доступен по сети без API-ключа.")
     uvicorn.run(app, host=args.host, port=args.port)

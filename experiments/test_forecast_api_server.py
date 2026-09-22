@@ -1,5 +1,8 @@
 """API/UI tests with artificial cash-flow records; no customer data used."""
 import json
+from calendar import monthrange
+from datetime import date
+from decimal import Decimal
 from pathlib import Path
 import tempfile
 import unittest
@@ -7,7 +10,7 @@ import unittest
 import pandas as pd
 from fastapi.testclient import TestClient
 
-from forecast_api_server import ForecastStore, create_app
+from forecast_api_server import ForecastStore, allocated_cents, create_app
 
 
 def create_demo(directory):
@@ -98,6 +101,83 @@ class ForecastUITests(unittest.TestCase):
         original.iloc[:0].to_parquet(path, index=False)
         with self.assertRaisesRegex(ValueError, "пуста"):
             ForecastStore(self.path)
+
+    def test_daily_flag_off_by_default(self):
+        self.assertFalse(self.client.get("/ui/meta").json()["daily_allocation_enabled"])
+        for path in ("/ui/daily-dates", "/ui/daily-allocation"):
+            self.assertEqual(self.client.get(path).status_code, 404)
+        with TestClient(create_app(self.store, daily_allocation=True)) as client:
+            self.assertTrue(client.get("/ui/meta").json()["daily_allocation_enabled"])
+            query = "?inn=7700000001&period=2026-01"
+            self.assertEqual(client.get("/forecast" + query).json(), self.client.get("/forecast" + query).json())
+
+    def test_daily_auth_and_validation(self):
+        with TestClient(create_app(self.store, api_key="secret", daily_allocation=True)) as client:
+            headers = {"X-API-Key": "secret"}
+            for path in ("/ui/daily-dates?inn=7700000001&period=2026-01",
+                         "/ui/daily-allocation?inn=7700000001&start_date=2026-01-25"):
+                self.assertEqual(client.get(path).status_code, 401)
+                self.assertEqual(client.get(path, headers=headers).status_code, 200)
+            for start in ("2026-02-30", "2026-1-1", "not-a-date", "9999-12-31"):
+                response = client.get("/ui/daily-allocation", params={"inn": "7700000001", "start_date": start}, headers=headers)
+                self.assertEqual(response.status_code, 422)
+            for inn, start in (("unknown", "2026-01-01"), ("7700000002", "2026-01-25")):
+                response = client.get("/ui/daily-allocation", params={"inn": inn, "start_date": start}, headers=headers)
+                self.assertEqual(response.status_code, 404)
+
+    def test_daily_dates_exclude_missing_next_month(self):
+        complete = self.store.daily_dates("7700000001", "2026-01")["dates"]
+        self.assertEqual(len(complete), 31)
+        missing_next = self.store.daily_dates("7700000002", "2026-01")["dates"]
+        self.assertEqual(missing_next[-1], "2026-01-18")
+        self.assertEqual(len(missing_next), 18)
+        last_month = self.store.daily_dates("7700000001", "2026-06")["dates"]
+        self.assertEqual(last_month[-1], "2026-06-17")
+        with self.assertRaises(LookupError):
+            self.store.daily_allocation("7700000001", "2026-06-18")
+
+    def test_daily_month_boundary_and_exact_totals(self):
+        data = self.store.daily_allocation("7700000001", "2026-01-25")
+        self.assertFalse(data["is_daily_model"])
+        self.assertEqual(len(data["rows"]), 14)
+        self.assertEqual(data["end_date"], "2026-02-07")
+        self.assertEqual([row["период"] for row in data["source_months"]], ["2026-01", "2026-02"])
+        cumulative = Decimal("0")
+        for row in data["rows"]:
+            day = date.fromisoformat(row["date"])
+            monthly = self.store.forecast("7700000001", row["source_period"])
+            self.assertEqual(row["inflow"], allocated_cents(monthly["прогноз_зачислений"], day) / 100)
+            net = Decimal(str(row["inflow"])) - Decimal(str(row["outflow"]))
+            self.assertEqual(Decimal(str(row["net_flow"])), net)
+            cumulative += net
+            self.assertEqual(Decimal(str(row["cumulative_net_flow"])), cumulative)
+        for column in ("inflow", "outflow", "net_flow"):
+            self.assertEqual(sum(Decimal(str(row[column])) for row in data["rows"]), Decimal(str(data["totals"][column])))
+        other = self.store.daily_allocation("7700000001", "2026-01-26")
+        for first, second in zip(data["rows"][1:], other["rows"]):
+            self.assertEqual((first["date"], first["inflow"], first["outflow"]),
+                             (second["date"], second["inflow"], second["outflow"]))
+
+    def test_allocation_conserves_every_month_to_kopeck(self):
+        for year, month in ((2024, 2), (2026, 2), (2026, 4), (2026, 12)):
+            for amount in (0, .01, .03, .29, 1, 1234567.89):
+                days = monthrange(year, month)[1]
+                allocated = [allocated_cents(amount, date(year, month, day)) for day in range(1, days + 1)]
+                self.assertEqual(sum(allocated), int(Decimal(str(amount)) * 100))
+                self.assertLessEqual(max(allocated) - min(allocated), 1)
+
+    def test_leap_day_and_new_year(self):
+        frame = pd.read_parquet(self.path / "forecasts_api.parquet")
+        for periods, start, end in ((["2024-02", "2024-03"], "2024-02-23", "2024-03-07"),
+                                    (["2026-12", "2027-01"], "2026-12-25", "2027-01-07")):
+            pair = frame.iloc[:2].copy()
+            pair["period"] = periods
+            pair.to_parquet(self.path / "forecasts_api.parquet", index=False)
+            store = ForecastStore(self.path)
+            data = store.daily_allocation("7700000001", start)
+            self.assertEqual(data["end_date"], end)
+            if start.startswith("2024"):
+                self.assertIn("2024-02-29", [row["date"] for row in data["rows"]])
 
 
 if __name__ == "__main__":
