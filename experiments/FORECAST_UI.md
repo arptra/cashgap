@@ -5,6 +5,17 @@
 
 ## Запуск
 
+Полный предоставленный TypeScript-фронт с виджетом «Анализ ликвидности»
+включается параметром `--ui adjutant`.
+Подробности — [liquidity_ui/README.md](liquidity_ui/README.md).
+Пример с распределением месячных сумм на 14 дней:
+
+```bash
+python experiments/forecast_api_server.py --model-dir "/путь/к/saved_model" --ui adjutant --daily-allocation
+```
+
+Ниже описан прежний экран (`--ui classic`, по умолчанию).
+
 Перенесите обновлённые `forecast_api_server.py` и `forecast_ui.html`
 в одну папку либо обновите репозиторий. Остановите предыдущий сервер через Ctrl+C.
 Из папки проекта, в вашем активированном окружении:

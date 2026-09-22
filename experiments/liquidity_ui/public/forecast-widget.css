@@ -1,0 +1,53 @@
+/* Model-backed widget: the original dashboard layout and palette are retained. */
+[hidden] { display: none !important; }
+[data-demo]::before { content: 'ДЕМО · НЕ ДАННЫЕ ИНН'; display: block; margin-bottom: 10px; color: #77817d; font-size: 10px; letter-spacing: .06em; }
+.info-banner { height: auto; min-height: 48px; line-height: 1.5; }
+.info-banner > svg { flex-shrink: 0; }
+.forecast-widget { min-width: 0; }
+.forecast-widget .section-heading { flex-wrap: wrap; gap: 10px; }
+.forecast-live { padding: 5px 9px; border-radius: 7px; background: #e1f3ec; color: #087665; font-size: 12px; white-space: nowrap; }
+.forecast-caption { margin: 8px 0 18px; font-size: 12px; color: var(--muted); line-height: 1.5; }
+.forecast-controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: end; gap: 12px; }
+.forecast-controls label, .forecast-access label { display: grid; gap: 7px; min-width: 0; color: #52625d; font-size: 12px; line-height: 1.4; }
+.forecast-controls input, .forecast-controls select, .forecast-access input, #boot-key { font: inherit; width: 100%; min-width: 0; min-height: 38px; padding: 8px 10px; border: 1px solid #cbd8d2; border-radius: 8px; color: var(--ink); background: #fff; }
+.forecast-controls select:focus-visible { outline: 3px solid rgba(0, 156, 137, .25); outline-offset: 2px; }
+.forecast-controls button { font-size: 12px; min-height: 38px; }
+.forecast-search-status, .forecast-status { font-size: 12px; line-height: 1.5; color: #52625d; }
+.forecast-status:not(:empty) { padding: 12px; background: #edf4f1; border-radius: 8px; }
+.forecast-status button { margin-top: 10px; }
+.forecast-access { margin: 12px 0; font-size: 12px; color: var(--muted); }
+.forecast-access summary, .forecast-table summary { cursor: pointer; }
+.forecast-access label { margin: 12px 0 8px; }
+.forecast-access input { max-width: 100%; }
+.forecast-period-title { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; margin: 18px 0 12px; font-size: 12px; }
+.forecast-period-title span { color: var(--muted); }
+.forecast-totals { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.forecast-totals > div { padding: 12px; border: 1px solid #d9e6df; border-radius: 9px; background: rgba(249,252,250,.8); }
+.forecast-totals span { display: block; margin-bottom: 7px; font-size: 12px; color: var(--muted); }
+.forecast-totals strong { display: block; font-size: clamp(14px, 1.1vw, 20px); font-weight: 600; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.forecast-negative { color: var(--danger); }
+.forecast-chart-scroll { overflow-x: auto; margin-top: 22px; }
+.forecast-chart { min-width: 100%; height: 240px; }
+.forecast-chart text { font-size: 11px; fill: #69716f; }
+.forecast-grid { stroke: #dce4df; stroke-width: 1; }
+.forecast-zero { stroke: #7f9289; stroke-width: 1.2; }
+.forecast-line { fill: none; stroke: #078f7e; stroke-width: 2; }
+.forecast-point { fill: #078f7e; }
+.series-inflow { fill: #5144d8; background: #5144d8; }
+.series-outflow { fill: #c018a5; background: #c018a5; }
+.series-net, .series-balance { fill: #078f7e; background: #078f7e; }
+.forecast-legend { margin-top: 10px; font-size: 12px; gap: 12px; }
+.forecast-legend i { width: 8px; height: 8px; }
+.forecast-method, .forecast-balance-note { font-size: 12px; line-height: 1.6; color: #52625d; }
+.forecast-method { padding: 12px; border-left: 2px solid var(--green); background: #f0f7f3; border-radius: 3px 8px 8px 3px; }
+.forecast-table { margin-top: 15px; font-size: 12px; }
+.forecast-table-scroll { overflow-x: auto; }
+.forecast-table table { width: 100%; margin: 12px 0; border-collapse: collapse; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.forecast-table td, .forecast-table th { padding: 10px; border-bottom: 1px solid #dce4df; text-align: right; }
+.forecast-table td:first-child, .forecast-table th:first-child { text-align: left; }
+.forecast-source { margin: 16px 0 0; font-size: 11px; line-height: 1.6; color: var(--muted); overflow-wrap: anywhere; }
+.assistant-thinking { height: auto; line-height: 1.5; }
+@media (max-width: 600px) {
+  .forecast-controls { grid-template-columns: 1fr; }
+  .forecast-totals strong { font-size: 16px; }
+}

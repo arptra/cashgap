@@ -179,6 +179,73 @@ class ForecastUITests(unittest.TestCase):
             if start.startswith("2024"):
                 self.assertIn("2024-02-29", [row["date"] for row in data["rows"]])
 
+    def test_adjutant_full_frontend_and_assets(self):
+        with TestClient(create_app(self.store, ui="adjutant", daily_allocation=True)) as client:
+            page = client.get("/")
+            self.assertEqual(page.status_code, 200)
+            self.assertIn("/adjutant/main.js", page.text)
+            self.assertIn("/adjutant/forecast-widget.css", page.text)
+            for name in ("main.js", "forecast-widget.js", "styles.css", "forecast-widget.css", "assets/brand-logo.png"):
+                self.assertEqual(client.get("/adjutant/" + name).status_code, 200)
+            self.assertEqual(client.get("/adjutant/../demo_dashboard.json").status_code, 404)
+            script = client.get("/adjutant/main.js").text
+            for title in ("Анализ ликвидности", "Рекомендации", "Движение средств"):
+                # Liquidity itself is now a separate TypeScript module; other widgets are intact.
+                self.assertIn(title, script + client.get("/adjutant/forecast-widget.js").text)
+
+    def test_adjutant_dashboard_contract_and_actual_model_sums(self):
+        with TestClient(create_app(self.store, ui="adjutant", daily_allocation=True)) as client:
+            response = client.get("/api/dashboard", params={"inn": "7700000001", "period": "2026-01", "start_date": "2026-01-25"})
+            self.assertEqual(response.status_code, 200)
+            data = response.json()
+            for key in ("company", "metrics", "recommendation", "counterparties", "comparisons", "cashFlow", "assistant"):
+                self.assertIn(key, data)
+            self.assertIn("демонстрационные", data["demoNotice"])
+            widget = data["liquidityAnalysis"]
+            self.assertEqual(widget["totals"], self.store.daily_allocation("7700000001", "2026-01-25")["totals"])
+            self.assertEqual(len(widget["categories"]), 14)
+            self.assertEqual(widget["context"]["endDate"], "2026-02-07")
+            self.assertFalse(widget["context"]["isDailyModel"])
+            self.assertIsNone(widget["context"]["openingBalance"])
+            self.assertTrue(all(row["closing_balance"] is None for row in widget["rows"]))
+            self.assertEqual(widget["series"][2]["id"], "net")
+
+    def test_adjutant_opening_balance_is_user_input_not_demo_balance(self):
+        with TestClient(create_app(self.store, daily_allocation=True)) as client:
+            widget = client.get("/api/dashboard", params={"inn": "7700000001", "period": "2026-01", "opening_balance": "1000.25"}).json()["liquidityAnalysis"]
+            self.assertEqual(widget["context"]["openingBalance"], 1000.25)
+            self.assertEqual(widget["series"][2]["id"], "balance")
+            for row in widget["rows"]:
+                self.assertEqual(Decimal(str(row["closing_balance"])), Decimal("1000.25") + Decimal(str(row["cumulative_net_flow"])))
+            self.assertEqual(widget["context"]["firstNegativeDate"], "2026-01-01")
+            fresh = client.get("/api/dashboard", params={"inn": "7700000002"}).json()["liquidityAnalysis"]
+            self.assertIsNone(fresh["context"]["openingBalance"])
+            self.assertEqual(fresh["context"]["availableDates"][-1], "2026-01-18")
+
+    def test_adjutant_monthly_mode_and_auth(self):
+        with TestClient(create_app(self.store, api_key="secret", ui="adjutant")) as client:
+            self.assertEqual(client.get("/api/dashboard").status_code, 401)
+            response = client.get("/api/dashboard", headers={"X-API-Key": "secret"})
+            widget = response.json()["liquidityAnalysis"]
+            self.assertFalse(widget["context"]["dailyAllocationEnabled"])
+            self.assertEqual(widget["totals"]["net_flow"], -425_000)
+            self.assertEqual(len(widget["categories"]), 1)
+            self.assertEqual(client.get("/api/dashboard?start_date=2026-01-01", headers={"X-API-Key": "secret"}).status_code, 422)
+
+    def test_adjutant_rejects_invalid_requests_without_demo_fallback(self):
+        with TestClient(create_app(self.store, daily_allocation=True)) as client:
+            for params, status in (({"inn": "unknown"}, 404),
+                                   ({"inn": "7700000002", "period": "2026-02"}, 404),
+                                   ({"inn": "7700000002", "start_date": "2026-01-31"}, 404),
+                                   ({"period": "2026-01", "start_date": "2026-02-01"}, 422),
+                                   ({"opening_balance": "NaN"}, 422),
+                                   ({"opening_balance": "inf"}, 422),
+                                   ({"opening_balance": "1000000000001"}, 422),
+                                   ({"start_date": "2026-02-30"}, 422)):
+                response = client.get("/api/dashboard", params=params)
+                self.assertEqual(response.status_code, status, response.text)
+                self.assertNotIn("liquidityAnalysis", response.json())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

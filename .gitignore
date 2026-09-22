@@ -8,6 +8,7 @@ __pycache__/
 backend/cashgap.db
 backend/cashgap.db-*
 frontend/node_modules/
+experiments/liquidity_ui/node_modules/
 frontend/dist/
 *.tsbuildinfo
 frontend/vite.config.js

@@ -43,6 +43,7 @@ import pandas as pd
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 
@@ -233,7 +234,9 @@ class ForecastStore:
 
 
 def create_app(store: ForecastStore, api_key: Optional[str] = None,
-               daily_allocation: bool = False) -> FastAPI:
+               daily_allocation: bool = False, ui: str = "classic") -> FastAPI:
+    if ui not in ("classic", "adjutant"):
+        raise ValueError("Неизвестный интерфейс: {}".format(ui))
     app = FastAPI(
         title="API прогноза денежных потоков",
         description=(
@@ -258,12 +261,32 @@ def create_app(store: ForecastStore, api_key: Optional[str] = None,
 
     @app.get("/", response_class=HTMLResponse, include_in_schema=False)
     def business_ui():
-        ui_path = Path(__file__).with_name("forecast_ui.html")
+        ui_path = (Path(__file__).parent / "liquidity_ui" / "public" / "index.html"
+                   if ui == "adjutant" else Path(__file__).with_name("forecast_ui.html"))
         if not ui_path.exists():
-            raise HTTPException(status_code=503, detail="Скопируйте forecast_ui.html рядом с forecast_api_server.py.")
+            raise HTTPException(status_code=503, detail="Не найден интерфейс: {}. Перенесите всю папку experiments из обновлённого проекта.".format(ui_path))
         return HTMLResponse(ui_path.read_text(encoding="utf-8"), headers={
-            "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+            "Content-Security-Policy": "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
         })
+
+    assets = Path(__file__).parent / "liquidity_ui" / "public"
+    if assets.is_dir():
+        app.mount("/adjutant", StaticFiles(directory=str(assets)), name="adjutant_assets")
+
+    @app.get("/api/dashboard", summary="Весь TypeScript-дашборд с прогнозом в виджете ликвидности")
+    def adjutant_dashboard(inn: Optional[str] = Query(default=None, max_length=64),
+                           period: Optional[str] = Query(default=None, max_length=10),
+                           start_date: Optional[str] = Query(default=None, max_length=10),
+                           opening_balance: Optional[float] = Query(default=None),
+                           x_api_key: Optional[str] = Header(default=None)):
+        authorize(x_api_key)
+        from adjutant_dashboard import dashboard_payload
+        try:
+            return dashboard_payload(store, daily_allocation, inn, period, start_date, opening_balance)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        except LookupError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
 
     @app.get("/ui/meta", summary="Описание набора прогнозов для бизнес-экрана")
     def ui_meta(x_api_key: Optional[str] = Header(default=None)):
@@ -381,6 +404,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--daily-allocation", action="store_true",
                         help="Включить в UI равномерное распределение месячных сумм на 14 дней (не дневная модель)")
+    parser.add_argument("--ui", choices=("classic", "adjutant"), default="classic",
+                        help="classic — прежний экран; adjutant — весь предоставленный TypeScript-фронт")
     parser.add_argument(
         "--api-key", default=None,
         help="Если задан, клиенты должны передавать заголовок X-API-Key",
@@ -391,7 +416,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     store = ForecastStore(Path(args.model_dir))
-    app = create_app(store, args.api_key, daily_allocation=args.daily_allocation)
+    app = create_app(store, args.api_key, daily_allocation=args.daily_allocation, ui=args.ui)
     print("\n=== API ПРОГНОЗА ДЕНЕЖНЫХ ПОТОКОВ ===")
     print("Модель: {}".format(store.metadata.get("model_name_ru", store.metadata.get("model_id"))))
     print("ИНН: {:,} | периоды: {} — {}".format(
