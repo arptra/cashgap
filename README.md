@@ -62,6 +62,17 @@ python forecast_2025.py --inflow /data/inflow.parquet --outflow /data/outflow.pa
 Во всех файлах есть приход, расход и чистый поток. Все 12 месяцев прогнозируются
 из конца 2024 года; будущий факт не подставляется. Другой год задаётся `--year`.
 
+Чтобы получить **все ИНН и даты отрицательного фактического потока за 2025 год**
+из двух Parquet без обучения модели, используйте
+[отдельный скрипт выгрузки](experiments/NEGATIVE_CASHFLOW.md):
+
+```bash
+python experiments/export_negative_cashflow.py --outflow /data/outflow.parquet --inflow /data/inflow.parquet
+```
+
+Нужен только PyArrow. Результат: отрицательные дни, сводка по ИНН и отрицательные
+месячные итоги в `artifacts/negative_cashflow_2025`.
+
 Для экспериментов на двух Parquet-файлах (`dt_inn`/списания и
 `kt_inn`/зачисления), месячного MAPE, двух GPU, автотюнинга и дневного demo
 используйте отдельную [инструкцию запуска в Jupyter](experiments/RUN_JUPYTER.md).
